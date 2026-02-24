@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Virtual Environment
+venv/
+env/
+.env/
+
+# MuJoCo & Meta-World specifics
+*.log
+*.lock
+.mujoco/
+
+# Research Results & ML Checkpoints
+results/
+checkpoints/
+*.pth
+*.pt
+*.mp4
+
+# Misc
+.DS_Store
+.idea/
