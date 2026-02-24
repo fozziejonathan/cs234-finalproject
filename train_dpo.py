@@ -90,13 +90,13 @@ class ContinuousDPOPolicy(nn.Module):
         nn.init.orthogonal_(self.mu_head.weight, gain=0.01)
 
     def forward(self, obs: torch.Tensor):
-        x   = self.trunk(obs)
-        mu  = self.mu_head(x)
+        x = self.trunk(obs)
+        mu = self.mu_head(x)
         std = torch.exp(torch.clamp(self.log_std, -2.0, 2.0)).expand_as(mu)
         return mu, std
 
     def get_trajectory_log_prob(
-        self, obs_seq: torch.Tensor, act_seq: torch.Tensor
+            self, obs_seq: torch.Tensor, act_seq: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute log π_θ(τ) = Σ_t log π_θ(a_t | s_t)
@@ -113,10 +113,10 @@ class ContinuousDPOPolicy(nn.Module):
         -------
         Scalar tensor (trajectory log-probability).
         """
-        mu, std = self.forward(obs_seq)                # (T, act_dim)
-        dist    = Normal(mu, std)
-        step_lp = dist.log_prob(act_seq).sum(dim=-1)   # (T,)  sum over act dims
-        return step_lp.sum()                           # scalar: sum over time
+        mu, std = self.forward(obs_seq)  # (T, act_dim)
+        dist = Normal(mu, std)
+        step_lp = dist.log_prob(act_seq).sum(dim=-1)  # (T,)  sum over act dims
+        return step_lp.sum()  # scalar: sum over time
 
     def get_action(self, obs: torch.Tensor) -> np.ndarray:
         """Deterministic action for evaluation (use mean of Gaussian)."""
@@ -130,13 +130,13 @@ class ContinuousDPOPolicy(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_dpo_loss(
-    policy:     ContinuousDPOPolicy,
-    ref_policy: ContinuousDPOPolicy,
-    obs_w:  torch.Tensor,    # chosen   observations  (T_w, obs_dim)
-    act_w:  torch.Tensor,    # chosen   actions       (T_w, act_dim)
-    obs_l:  torch.Tensor,    # rejected observations  (T_l, obs_dim)
-    act_l:  torch.Tensor,    # rejected actions       (T_l, act_dim)
-    beta:   float = DPO_BETA,
+        policy: ContinuousDPOPolicy,
+        ref_policy: ContinuousDPOPolicy,
+        obs_w: torch.Tensor,  # chosen   observations  (T_w, obs_dim)
+        act_w: torch.Tensor,  # chosen   actions       (T_w, act_dim)
+        obs_l: torch.Tensor,  # rejected observations  (T_l, obs_dim)
+        act_l: torch.Tensor,  # rejected actions       (T_l, act_dim)
+        beta: float = DPO_BETA,
 ) -> tuple[torch.Tensor, dict]:
     """
     Full DPO contrastive loss for a single preference pair.
@@ -165,16 +165,16 @@ def compute_dpo_loss(
 
     # Diagnostics
     with torch.no_grad():
-        margin   = (implicit_reward_w - implicit_reward_l).item()
+        margin = (implicit_reward_w - implicit_reward_l).item()
         accuracy = float(implicit_reward_w > implicit_reward_l)
-        kl_w     = (log_pi_w - log_ref_w).item() / beta   # unnormalised KL contribution
+        kl_w = (log_pi_w - log_ref_w).item() / beta  # unnormalised KL contribution
 
     metrics = {
-        "reward_w":   implicit_reward_w.item(),
-        "reward_l":   implicit_reward_l.item(),
-        "margin":     margin,
-        "accuracy":   accuracy,
-        "kl_chosen":  kl_w,
+        "reward_w": implicit_reward_w.item(),
+        "reward_l": implicit_reward_l.item(),
+        "margin": margin,
+        "accuracy": accuracy,
+        "kl_chosen": kl_w,
     }
     return loss, metrics
 
@@ -184,10 +184,10 @@ def compute_dpo_loss(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_dpo_alignment(
-    data_path: str = PREF_DATASET_PATH,
-    epochs: int    = DPO_EPOCHS,
-    lr: float      = DPO_LR,
-    beta: float    = DPO_BETA,
+        data_path: str = PREF_DATASET_PATH,
+        epochs: int = DPO_EPOCHS,
+        lr: float = DPO_LR,
+        beta: float = DPO_BETA,
 ) -> ContinuousDPOPolicy:
     """
     Full DPO training loop.
@@ -200,7 +200,7 @@ def run_dpo_alignment(
     with open(data_path, "rb") as f:
         dataset_dict = pickle.load(f)
     train_data = dataset_dict["train"]
-    val_data   = dataset_dict["val"]
+    val_data = dataset_dict["val"]
 
     # ── Build policy and frozen reference ────────────────────────────────────
     policy = ContinuousDPOPolicy().to(DEVICE)
@@ -214,12 +214,12 @@ def run_dpo_alignment(
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  DPO Training  (β={beta}, lr={lr}, {epochs} epochs)")
     print(f"  Train pairs: {len(train_data)}  |  Val pairs: {len(val_data)}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
-    best_val_acc  = -1.0
+    best_val_acc = -1.0
     os.makedirs(os.path.dirname(DPO_SAVE_PATH), exist_ok=True)
 
     for epoch in range(epochs):
@@ -243,10 +243,10 @@ def run_dpo_alignment(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss   += loss.item()
-            epoch_acc    += metrics["accuracy"]
+            epoch_loss += loss.item()
+            epoch_acc += metrics["accuracy"]
             epoch_margin += metrics["margin"]
-            epoch_kl     += metrics["kl_chosen"]
+            epoch_kl += metrics["kl_chosen"]
 
         scheduler.step()
 
@@ -263,14 +263,14 @@ def run_dpo_alignment(
                     policy, ref_policy, obs_w, act_w, obs_l, act_l, beta=beta
                 )
                 val_loss += loss.item()
-                val_acc  += metrics["accuracy"]
+                val_acc += metrics["accuracy"]
 
         n_tr, n_v = len(train_data), len(val_data)
-        print(f"  Epoch {epoch+1:>3}/{epochs}  "
-              f"| train loss: {epoch_loss/n_tr:.4f}  acc: {epoch_acc/n_tr:.2%}  "
-              f"margin: {epoch_margin/n_tr:.3f}  "
-              f"KL(chosen): {epoch_kl/n_tr:.3f}  "
-              f"| val loss: {val_loss/n_v:.4f}  acc: {val_acc/n_v:.2%}")
+        print(f"  Epoch {epoch + 1:>3}/{epochs}  "
+              f"| train loss: {epoch_loss / n_tr:.4f}  acc: {epoch_acc / n_tr:.2%}  "
+              f"margin: {epoch_margin / n_tr:.3f}  "
+              f"KL(chosen): {epoch_kl / n_tr:.3f}  "
+              f"| val loss: {val_loss / n_v:.4f}  acc: {val_acc / n_v:.2%}")
 
         if val_acc / n_v > best_val_acc:
             best_val_acc = val_acc / n_v
@@ -289,8 +289,8 @@ def run_dpo_alignment(
 
 def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> dict:
     """Run the DPO policy in MetaWorld and return task success / return stats."""
-    ml1   = metaworld.ML1(ENV_NAME)
-    env   = ml1.train_classes[ENV_NAME]()
+    ml1 = metaworld.ML1(ENV_NAME)
+    env = ml1.train_classes[ENV_NAME]()
     tasks = ml1.train_tasks
 
     policy.eval()
@@ -304,7 +304,7 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
             ep_ret, success = 0.0, False
 
             for _ in range(MAX_EPISODE_STEPS):
-                obs_t  = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
                 action = policy.get_action(obs_t)
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, info = env.step(action)
@@ -318,8 +318,8 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
             successes.append(float(success))
 
     results = {
-        "mean_return":  float(np.mean(returns)),
-        "std_return":   float(np.std(returns)),
+        "mean_return": float(np.mean(returns)),
+        "std_return": float(np.std(returns)),
         "success_rate": float(np.mean(successes)),
     }
     print(f"[DPO Eval]  Return: {results['mean_return']:.2f} ± {results['std_return']:.2f}  "
@@ -333,19 +333,19 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train DPO for continuous control.")
-    parser.add_argument("--data",   default=PREF_DATASET_PATH)
-    parser.add_argument("--epochs", type=int,   default=DPO_EPOCHS)
-    parser.add_argument("--lr",     type=float, default=DPO_LR)
-    parser.add_argument("--beta",   type=float, default=DPO_BETA,
+    parser.add_argument("--data", default=PREF_DATASET_PATH)
+    parser.add_argument("--epochs", type=int, default=DPO_EPOCHS)
+    parser.add_argument("--lr", type=float, default=DPO_LR)
+    parser.add_argument("--beta", type=float, default=DPO_BETA,
                         help="KL regularisation strength (0.05–0.2 for robotics)")
-    parser.add_argument("--eval",   action="store_true", help="Run eval after training")
+    parser.add_argument("--eval", action="store_true", help="Run eval after training")
     args = parser.parse_args()
 
     policy = run_dpo_alignment(
-        data_path = args.data,
-        epochs    = args.epochs,
-        lr        = args.lr,
-        beta      = args.beta,
+        data_path=args.data,
+        epochs=args.epochs,
+        lr=args.lr,
+        beta=args.beta,
     )
 
     if args.eval:

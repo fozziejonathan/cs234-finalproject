@@ -63,14 +63,14 @@ class SyntheticPreferenceGenerator:
     """
 
     def __init__(
-        self,
-        raw_data_path: str = RAW_DATA_PATH,
-        noise_std: float   = HUMAN_ERROR_NOISE,
-        gamma: float       = PPO_GAMMA,
+            self,
+            raw_data_path: str = RAW_DATA_PATH,
+            noise_std: float = HUMAN_ERROR_NOISE,
+            gamma: float = PPO_GAMMA,
     ):
         self.raw_data_path = raw_data_path
-        self.noise_std     = noise_std
-        self.gamma         = gamma
+        self.noise_std = noise_std
+        self.gamma = gamma
 
     def _discounted_return(self, rewards: np.ndarray) -> float:
         """Compute discounted cumulative return: Σ_t γ^t r_t."""
@@ -85,11 +85,11 @@ class SyntheticPreferenceGenerator:
                 grp = f[key]
                 rewards = grp["rewards"][:]
                 traj = {
-                    "observations": grp["observations"][:],   # (T, 39)
-                    "actions":      grp["actions"][:],        # (T,  4)
-                    "true_return":  self._discounted_return(rewards),
+                    "observations": grp["observations"][:],  # (T, 39)
+                    "actions": grp["actions"][:],  # (T,  4)
+                    "true_return": self._discounted_return(rewards),
                     "undiscounted_return": float(rewards.sum()),
-                    "length":       len(rewards),
+                    "length": len(rewards),
                 }
                 trajectories.append(traj)
 
@@ -101,10 +101,10 @@ class SyntheticPreferenceGenerator:
         return trajectories
 
     def synthesize_datasets(
-        self,
-        num_pairs: int = NUM_PREF_PAIRS,
-        save_path: str = PREF_DATASET_PATH,
-        train_frac: float = 0.9,
+            self,
+            num_pairs: int = NUM_PREF_PAIRS,
+            save_path: str = PREF_DATASET_PATH,
+            train_frac: float = 0.9,
     ) -> None:
         """
         Sample trajectory pairs, inject perception noise, assign labels, and
@@ -121,7 +121,7 @@ class SyntheticPreferenceGenerator:
         assert n >= 2, "Need at least 2 trajectories to form pairs."
 
         preference_pairs = []
-        flip_count = 0   # # of times noise flipped the "true" preference
+        flip_count = 0  # # of times noise flipped the "true" preference
 
         for _ in range(num_pairs):
             idx_a, idx_b = np.random.choice(n, size=2, replace=False)
@@ -147,16 +147,16 @@ class SyntheticPreferenceGenerator:
                 flip_count += 1
 
             preference_pairs.append({
-                "chosen":   {k: chosen[k]   for k in ("observations", "actions", "true_return")},
+                "chosen": {k: chosen[k] for k in ("observations", "actions", "true_return")},
                 "rejected": {k: rejected[k] for k in ("observations", "actions", "true_return")},
-                "margin":   chosen["true_return"] - rejected["true_return"],
+                "margin": chosen["true_return"] - rejected["true_return"],
             })
 
         # Shuffle and split
         np.random.shuffle(preference_pairs)
-        split_idx  = int(len(preference_pairs) * train_frac)
+        split_idx = int(len(preference_pairs) * train_frac)
         train_data = preference_pairs[:split_idx]
-        val_data   = preference_pairs[split_idx:]
+        val_data = preference_pairs[split_idx:]
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "wb") as f:
@@ -176,15 +176,15 @@ class SyntheticPreferenceGenerator:
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Synthesize preference labels.")
-    parser.add_argument("--raw",   default=RAW_DATA_PATH,      help="Input HDF5 path")
-    parser.add_argument("--out",   default=PREF_DATASET_PATH,  help="Output .pkl path")
+    parser.add_argument("--raw", default=RAW_DATA_PATH, help="Input HDF5 path")
+    parser.add_argument("--out", default=PREF_DATASET_PATH, help="Output .pkl path")
     parser.add_argument("--pairs", type=int, default=NUM_PREF_PAIRS, help="# preference pairs")
     parser.add_argument("--noise", type=float, default=HUMAN_ERROR_NOISE,
                         help="Human error noise σ")
     args = parser.parse_args()
 
     gen = SyntheticPreferenceGenerator(
-        raw_data_path = args.raw,
-        noise_std     = args.noise,
+        raw_data_path=args.raw,
+        noise_std=args.noise,
     )
     gen.synthesize_datasets(num_pairs=args.pairs, save_path=args.out)
