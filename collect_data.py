@@ -1,17 +1,11 @@
 """
 collect_data.py
 ---------------
-Phase 1: Trajectory Generation
+Phase 1: Trajectory Collection
 
-Rolls out episodes in a MetaWorld environment using the task's built-in
-SCRIPTED EXPERT POLICY as the baseline (π_base).  This is the recommended
-baseline for MuJoCo/MetaWorld experiments — it is near-optimal, ships with
-the metaworld library, and requires zero extra infrastructure (unlike GR00T
-or Pi0.5 which need GPU servers / camera observations).
-
-Additive Gaussian exploration noise is injected on top of the scripted actions
-to produce behavioural diversity needed for preference ranking.  Without noise,
-all trajectories would look similar and preference labels would be uninformative.
+Runs the MetaWorld scripted expert policy with very low noise (σ=0.02) so
+nearly every episode succeeds. Success flag is stored per-trajectory so
+downstream BC can filter to genuinely successful demonstrations only.
 
 Output
 ------
@@ -21,205 +15,125 @@ data/raw_trajectories.h5
         actions       (T,  4)  float32
         rewards       (T,)     float32
         dones         (T,)     bool
-    trajectory_1/ ...
-
-Usage
------
-    python collect_data.py
-    python collect_data.py --env push-v3 --n 3000 --noise 0.15
+        attrs:
+            success   bool     — whether episode hit the success threshold
+            ep_return float    — undiscounted sum of rewards
 """
 
 import argparse
 import os
 import numpy as np
-import h5py  # pip install h5py
+import h5py
 import metaworld
 import metaworld.policies as mw_policies
-from config import (
-    ENV_NAME, NUM_TRAJECTORIES, MAX_EPISODE_STEPS,
-    EXPLORATION_NOISE, RAW_DATA_PATH
-)
+from config import ENV_NAME, MAX_EPISODE_STEPS, RAW_DATA_PATH
 
-# ─── Scripted Policy Lookup ────────────────────────────────────────────────────
-# MetaWorld's policy class names vary slightly across versions.
-# We use a name-fragment map + dynamic getattr lookup so this is version-robust.
-# Format: task-name → substring that uniquely identifies the policy class name.
-_POLICY_NAME_FRAGMENTS = {
-    "reach-v3": "Reach",
-    "push-v3": "Push",
-    "pick-place-v3": "PickPlace",
-    "door-open-v3": "DoorOpen",
-    "drawer-open-v3": "DrawerOpen",
-    "drawer-close-v3": "DrawerClose",
-    "button-press-topdown-v3": "ButtonPressTopdown",
-    "peg-insert-side-v3": "PegInsertionSide",
-    "window-open-v3": "WindowOpen",
-    "window-close-v3": "WindowClose",
+# ── Policy lookup ─────────────────────────────────────────────────────────────
+_POLICY_FRAGMENTS = {
+    "reach-v3":                  "Reach",
+    "push-v3":                   "Push",
+    "pick-place-v3":             "PickPlace",
+    "door-open-v3":              "DoorOpen",
+    "drawer-open-v3":            "DrawerOpen",
+    "drawer-close-v3":           "DrawerClose",
+    "button-press-topdown-v3":   "ButtonPressTopdown",
+    "peg-insert-side-v3":        "PegInsertionSide",
+    "window-open-v3":            "WindowOpen",
+    "window-close-v3":           "WindowClose",
 }
 
-
-def _build_policy_map():
-    """
-    Discover available Sawyer scripted policies dynamically from metaworld.policies.
-    Matches each task to the first class whose name contains the expected fragment.
-    This works across metaworld 2.x and 3.x regardless of exact class naming.
-    """
-    all_policy_names = [name for name in dir(mw_policies) if "Policy" in name]
-    policy_map = {}
-    for task, fragment in _POLICY_NAME_FRAGMENTS.items():
-        matches = [n for n in all_policy_names if fragment in n]
-        if matches:
-            policy_map[task] = getattr(mw_policies, matches[0])
-        else:
-            print(f"[WARN] No scripted policy found for '{task}' "
-                  f"(searched for fragment '{fragment}' in {all_policy_names[:5]}...)")
-    return policy_map
-
-
-SCRIPTED_POLICY_MAP = _build_policy_map()
-
-
-def make_env(env_name: str):
-    """
-    Instantiate a single Meta-World ML1 environment and randomly sample a task.
-    Returns (env, task_list) so callers can re-sample tasks for diversity.
-    """
-    ml1 = metaworld.ML1(env_name)
-    env = ml1.train_classes[env_name]()
-    tasks = ml1.train_tasks
-    return env, tasks
-
-
-def get_scripted_policy(env_name: str):
-    """
-    Return an instance of the MetaWorld scripted policy for this task.
-    Falls back to a random policy if the task is not in our map.
-    """
-    if env_name in SCRIPTED_POLICY_MAP:
-        policy_cls = SCRIPTED_POLICY_MAP[env_name]
-        print(f"[INFO] Using scripted expert policy: {policy_cls.__name__}")
-        return policy_cls()
-    else:
-        print(f"[WARN] No scripted policy found for '{env_name}'. "
-              f"Falling back to random actions. Add it to SCRIPTED_POLICY_MAP.")
+def _get_scripted_policy(env_name):
+    all_names = [n for n in dir(mw_policies) if "Policy" in n]
+    frag = _POLICY_FRAGMENTS.get(env_name)
+    if frag is None:
+        print(f"[WARN] No scripted policy for '{env_name}' — using random actions.")
         return None
+    matches = [n for n in all_names if frag in n]
+    if not matches:
+        print(f"[WARN] No policy matching '{frag}' found — using random actions.")
+        return None
+    cls = getattr(mw_policies, matches[0])
+    print(f"[INFO] Using scripted policy: {cls.__name__}")
+    return cls()
 
 
-class TrajectoryCollector:
-    """
-    Collects trajectories by running π_base + exploration noise in MetaWorld.
+def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
+    ml1    = metaworld.ML1(env_name)
+    env    = ml1.train_classes[env_name]()
+    tasks  = ml1.train_tasks
+    policy = _get_scripted_policy(env_name)
 
-    Parameters
-    ----------
-    env_name          : MetaWorld task string, e.g. "reach-v3"
-    num_trajectories  : How many episodes to record
-    max_steps         : Episode time-limit
-    exploration_noise : Std-dev of Gaussian noise added to scripted actions
-    """
+    os.makedirs(os.path.dirname(out) if os.path.dirname(out) else ".", exist_ok=True)
+    print(f"[INFO] Collecting {n} trajectories  env={env_name}  noise={noise}")
+    print(f"[INFO] Saving → {out}")
 
-    def __init__(
-            self,
-            env_name: str = ENV_NAME,
-            num_trajectories: int = NUM_TRAJECTORIES,
-            max_steps: int = MAX_EPISODE_STEPS,
-            exploration_noise: float = EXPLORATION_NOISE,
-    ):
-        self.env_name = env_name
-        self.num_trajectories = num_trajectories
-        self.max_steps = max_steps
-        self.exploration_noise = exploration_noise
+    returns, successes = [], []
 
-        self.env, self.tasks = make_env(env_name)
-        self.scripted_policy = get_scripted_policy(env_name)
+    with h5py.File(out, "w") as f:
+        for i in range(n):
+            env.set_task(tasks[i % len(tasks)])
+            obs, _ = env.reset()
 
-    def _get_action(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Compute π_base(obs) and add exploration noise.
+            obs_buf, act_buf, rew_buf, done_buf = [], [], [], []
+            ep_success = False
 
-        The scripted policy returns a 4-D action in [-1, 1].
-        We add N(0, σ²_explore) and clip back to action bounds.
-        """
-        if self.scripted_policy is not None:
-            base_action = self.scripted_policy.get_action(obs)
-        else:
-            base_action = self.env.action_space.sample()
+            for _ in range(MAX_EPISODE_STEPS):
+                if policy is not None:
+                    base = policy.get_action(obs)
+                else:
+                    base = env.action_space.sample()
+                action = np.clip(
+                    base + np.random.normal(0.0, noise, size=base.shape),
+                    env.action_space.low, env.action_space.high
+                ).astype(np.float32)
 
-        noise = np.random.normal(0.0, self.exploration_noise, size=base_action.shape)
-        noisy_action = np.clip(
-            base_action + noise,
-            self.env.action_space.low,
-            self.env.action_space.high,
-        )
-        return noisy_action.astype(np.float32)
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
 
-    def collect_and_serialize(self, save_path: str = RAW_DATA_PATH) -> None:
-        """
-        Run episodes and write all transitions to an HDF5 file.
+                obs_buf.append(obs.astype(np.float32))
+                act_buf.append(action)
+                rew_buf.append(float(reward))
+                done_buf.append(bool(done))
 
-        Each trajectory is stored in its own HDF5 group so large datasets
-        can be streamed without loading everything into RAM.
-        """
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        print(f"[INFO] Collecting {self.num_trajectories} trajectories → {save_path}")
+                if info.get("success", False):
+                    ep_success = True
 
-        episode_returns = []
+                obs = next_obs
+                if done:
+                    break
 
-        with h5py.File(save_path, "w") as f:
-            for i in range(self.num_trajectories):
-                # Rotate through available tasks for goal diversity
-                task = self.tasks[i % len(self.tasks)]
-                self.env.set_task(task)
+            ep_return = float(np.sum(rew_buf))
+            returns.append(ep_return)
+            successes.append(float(ep_success))
 
-                obs, _info = self.env.reset()
-                traj_obs, traj_acts, traj_rewards, traj_dones = [], [], [], []
+            grp = f.create_group(f"trajectory_{i}")
+            grp.create_dataset("observations", data=np.array(obs_buf))
+            grp.create_dataset("actions",      data=np.array(act_buf))
+            grp.create_dataset("rewards",      data=np.array(rew_buf, dtype=np.float32))
+            grp.create_dataset("dones",        data=np.array(done_buf))
+            grp.attrs["success"]   = ep_success
+            grp.attrs["ep_return"] = ep_return
 
-                for _step in range(self.max_steps):
-                    action = self._get_action(obs)
-                    next_obs, reward, terminated, truncated, _info = self.env.step(action)
-                    done = terminated or truncated
+            if (i + 1) % 500 == 0:
+                print(f"  [{i+1:>5}/{n}]  "
+                      f"mean_return: {np.mean(returns[-500:]):.2f}  "
+                      f"success_rate: {np.mean(successes[-500:]):.2%}")
 
-                    traj_obs.append(obs.astype(np.float32))
-                    traj_acts.append(action.astype(np.float32))
-                    traj_rewards.append(float(reward))
-                    traj_dones.append(bool(done))
-
-                    obs = next_obs
-                    if done:
-                        break
-
-                # Serialize to HDF5
-                grp = f.create_group(f"trajectory_{i}")
-                grp.create_dataset("observations", data=np.array(traj_obs, dtype=np.float32))
-                grp.create_dataset("actions", data=np.array(traj_acts, dtype=np.float32))
-                grp.create_dataset("rewards", data=np.array(traj_rewards, dtype=np.float32))
-                grp.create_dataset("dones", data=np.array(traj_dones, dtype=bool))
-
-                ep_return = sum(traj_rewards)
-                episode_returns.append(ep_return)
-
-                if (i + 1) % 200 == 0:
-                    mean_ret = np.mean(episode_returns[-200:])
-                    print(f"  [{i + 1:>5}/{self.num_trajectories}]  "
-                          f"last-200 mean return: {mean_ret:.2f}")
-
-        print(f"[INFO] Done. Mean return across all episodes: "
-              f"{np.mean(episode_returns):.2f}  |  "
-              f"Std: {np.std(episode_returns):.2f}")
-        print(f"[INFO] Return range: [{min(episode_returns):.2f}, {max(episode_returns):.2f}]")
+    overall_success = np.mean(successes)
+    n_success = int(sum(successes))
+    print(f"\n[INFO] Done.")
+    print(f"[INFO] Return — mean: {np.mean(returns):.2f}  "
+          f"std: {np.std(returns):.2f}  "
+          f"range: [{np.min(returns):.2f}, {np.max(returns):.2f}]")
+    print(f"[INFO] Success rate: {overall_success:.2%}  ({n_success}/{n} episodes)")
+    print(f"[INFO] Successful demos available for BC: {n_success}")
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Collect MetaWorld trajectories.")
-    parser.add_argument("--env", default=ENV_NAME, help="MetaWorld task name")
-    parser.add_argument("--n", type=int, default=NUM_TRAJECTORIES, help="# trajectories")
-    parser.add_argument("--noise", type=float, default=EXPLORATION_NOISE, help="Exploration noise σ")
-    parser.add_argument("--out", default=RAW_DATA_PATH, help="Output HDF5 path")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env",   default=ENV_NAME)
+    parser.add_argument("--n",     type=int,   default=5000)
+    parser.add_argument("--noise", type=float, default=0.02)
+    parser.add_argument("--out",   default=RAW_DATA_PATH)
     args = parser.parse_args()
-
-    collector = TrajectoryCollector(
-        env_name=args.env,
-        num_trajectories=args.n,
-        exploration_noise=args.noise,
-    )
-    collector.collect_and_serialize(save_path=args.out)
+    collect(args.env, args.n, args.noise, args.out)
