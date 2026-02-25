@@ -54,7 +54,34 @@ from config import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+OBS_NORM_PATH = "checkpoints/obs_normalizer.npz"
+DPO_BATCH_SIZE = 64
 print(f"[INFO] Running on device: {DEVICE}")
+
+
+class ObsNormalizer:
+    """
+    Loads the frozen normalization stats computed during RLHF Stage 1.
+    Must use the same stats as the RM to ensure consistent representation.
+    """
+
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def load(self, path: str):
+        data = np.load(path)
+        self.mean = data["mean"].astype(np.float32)
+        self.std = data["std"].astype(np.float32)
+        print(f"[INFO] ObsNormalizer loaded from {path}")
+
+    def normalize(self, obs: np.ndarray) -> np.ndarray:
+        return (obs - self.mean) / self.std
+
+    def normalize_tensor(self, obs_t: torch.Tensor) -> torch.Tensor:
+        mean_t = torch.FloatTensor(self.mean).to(obs_t.device)
+        std_t = torch.FloatTensor(self.std).to(obs_t.device)
+        return (obs_t - mean_t) / std_t
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,7 +143,7 @@ class ContinuousDPOPolicy(nn.Module):
         mu, std = self.forward(obs_seq)  # (T, act_dim)
         dist = Normal(mu, std)
         step_lp = dist.log_prob(act_seq).sum(dim=-1)  # (T,)  sum over act dims
-        return step_lp.sum()  # scalar: sum over time
+        return step_lp.mean()  # scalar: MEAN over time (prevents sigmoid saturation)
 
     def get_action(self, obs: torch.Tensor) -> np.ndarray:
         """Deterministic action for evaluation (use mean of Gaussian)."""
@@ -189,23 +216,18 @@ def run_dpo_alignment(
         lr: float = DPO_LR,
         beta: float = DPO_BETA,
 ) -> ContinuousDPOPolicy:
-    """
-    Full DPO training loop.
-
-    Because DPO is off-policy and uses no environment interaction,
-    this is much simpler and cheaper than PPO.  The entire training
-    runs on the static preference dataset.
-    """
     # ── Load dataset ──────────────────────────────────────────────────────────
     with open(data_path, "rb") as f:
         dataset_dict = pickle.load(f)
     train_data = dataset_dict["train"]
     val_data = dataset_dict["val"]
 
+    # ── Load obs normalizer (must be computed by RLHF Stage 1 first) ─────────
+    obs_normalizer = ObsNormalizer()
+    obs_normalizer.load(OBS_NORM_PATH)
+
     # ── Build policy and frozen reference ────────────────────────────────────
     policy = ContinuousDPOPolicy().to(DEVICE)
-
-    # Reference policy = deep copy, completely frozen
     ref_policy = copy.deepcopy(policy)
     ref_policy.eval()
     for param in ref_policy.parameters():
@@ -217,6 +239,7 @@ def run_dpo_alignment(
     print(f"\n{'=' * 60}")
     print(f"  DPO Training  (β={beta}, lr={lr}, {epochs} epochs)")
     print(f"  Train pairs: {len(train_data)}  |  Val pairs: {len(val_data)}")
+    print(f"  Batch size: {DPO_BATCH_SIZE}")
     print(f"{'=' * 60}")
 
     best_val_acc = -1.0
@@ -227,26 +250,42 @@ def run_dpo_alignment(
         np.random.shuffle(train_data)
 
         epoch_loss = epoch_acc = epoch_margin = epoch_kl = 0.0
+        n_batches = 0
 
-        for pair in train_data:
-            obs_w = torch.FloatTensor(pair["chosen"]["observations"]).to(DEVICE)
-            act_w = torch.FloatTensor(pair["chosen"]["actions"]).to(DEVICE)
-            obs_l = torch.FloatTensor(pair["rejected"]["observations"]).to(DEVICE)
-            act_l = torch.FloatTensor(pair["rejected"]["actions"]).to(DEVICE)
+        # Mini-batch loop
+        for batch_start in range(0, len(train_data), DPO_BATCH_SIZE):
+            batch = train_data[batch_start: batch_start + DPO_BATCH_SIZE]
+            batch_loss = 0.0
+            batch_acc = batch_margin = batch_kl = 0.0
 
-            loss, metrics = compute_dpo_loss(
-                policy, ref_policy, obs_w, act_w, obs_l, act_l, beta=beta
-            )
+            for pair in batch:
+                # Apply obs normalization before feeding to policy
+                obs_w = torch.FloatTensor(
+                    obs_normalizer.normalize(pair["chosen"]["observations"])).to(DEVICE)
+                act_w = torch.FloatTensor(pair["chosen"]["actions"]).to(DEVICE)
+                obs_l = torch.FloatTensor(
+                    obs_normalizer.normalize(pair["rejected"]["observations"])).to(DEVICE)
+                act_l = torch.FloatTensor(pair["rejected"]["actions"]).to(DEVICE)
 
+                loss, metrics = compute_dpo_loss(
+                    policy, ref_policy, obs_w, act_w, obs_l, act_l, beta=beta)
+
+                batch_loss += loss
+                batch_acc += metrics["accuracy"]
+                batch_margin += metrics["margin"]
+                batch_kl += metrics["kl_chosen"]
+
+            batch_loss = batch_loss / len(batch)
             optimizer.zero_grad()
-            loss.backward()
+            batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss += loss.item()
-            epoch_acc += metrics["accuracy"]
-            epoch_margin += metrics["margin"]
-            epoch_kl += metrics["kl_chosen"]
+            epoch_loss += batch_loss.item()
+            epoch_acc += batch_acc / len(batch)
+            epoch_margin += batch_margin / len(batch)
+            epoch_kl += batch_kl / len(batch)
+            n_batches += 1
 
         scheduler.step()
 
@@ -255,21 +294,21 @@ def run_dpo_alignment(
         val_loss = val_acc = 0.0
         with torch.no_grad():
             for pair in val_data:
-                obs_w = torch.FloatTensor(pair["chosen"]["observations"]).to(DEVICE)
+                obs_w = torch.FloatTensor(
+                    obs_normalizer.normalize(pair["chosen"]["observations"])).to(DEVICE)
                 act_w = torch.FloatTensor(pair["chosen"]["actions"]).to(DEVICE)
-                obs_l = torch.FloatTensor(pair["rejected"]["observations"]).to(DEVICE)
+                obs_l = torch.FloatTensor(
+                    obs_normalizer.normalize(pair["rejected"]["observations"])).to(DEVICE)
                 act_l = torch.FloatTensor(pair["rejected"]["actions"]).to(DEVICE)
                 loss, metrics = compute_dpo_loss(
-                    policy, ref_policy, obs_w, act_w, obs_l, act_l, beta=beta
-                )
+                    policy, ref_policy, obs_w, act_w, obs_l, act_l, beta=beta)
                 val_loss += loss.item()
                 val_acc += metrics["accuracy"]
 
-        n_tr, n_v = len(train_data), len(val_data)
+        n_v = len(val_data)
         print(f"  Epoch {epoch + 1:>3}/{epochs}  "
-              f"| train loss: {epoch_loss / n_tr:.4f}  acc: {epoch_acc / n_tr:.2%}  "
-              f"margin: {epoch_margin / n_tr:.3f}  "
-              f"KL(chosen): {epoch_kl / n_tr:.3f}  "
+              f"| train loss: {epoch_loss / n_batches:.4f}  acc: {epoch_acc / n_batches:.2%}  "
+              f"margin: {epoch_margin / n_batches:.3f}  "
               f"| val loss: {val_loss / n_v:.4f}  acc: {val_acc / n_v:.2%}")
 
         if val_acc / n_v > best_val_acc:
@@ -293,6 +332,9 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
     env = ml1.train_classes[ENV_NAME]()
     tasks = ml1.train_tasks
 
+    obs_normalizer = ObsNormalizer()
+    obs_normalizer.load(OBS_NORM_PATH)
+
     policy.eval()
     returns, successes = [], []
 
@@ -304,7 +346,8 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
             ep_ret, success = 0.0, False
 
             for _ in range(MAX_EPISODE_STEPS):
-                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
+                obs_norm = obs_normalizer.normalize(obs.astype(np.float32))
+                obs_t = torch.FloatTensor(obs_norm).unsqueeze(0).to(DEVICE)
                 action = policy.get_action(obs_t)
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, info = env.step(action)
@@ -316,6 +359,15 @@ def evaluate_dpo_policy(policy: ContinuousDPOPolicy, n_episodes: int = 20) -> di
 
             returns.append(ep_ret)
             successes.append(float(success))
+
+    results = {
+        "mean_return": float(np.mean(returns)),
+        "std_return": float(np.std(returns)),
+        "success_rate": float(np.mean(successes)),
+    }
+    print(f"[DPO Eval]  Return: {results['mean_return']:.2f} ± {results['std_return']:.2f}  "
+          f"|  Success rate: {results['success_rate']:.2%}")
+    return results
 
     results = {
         "mean_return": float(np.mean(returns)),

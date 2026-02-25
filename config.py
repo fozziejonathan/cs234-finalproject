@@ -18,11 +18,11 @@ RAW_DATA_PATH = "data/raw_trajectories.h5"
 
 # ─── Preference Labeling ──────────────────────────────────────────────────────
 NUM_PREF_PAIRS = 10000  # Pairwise preference comparisons to synthesize
-# FIX 1: Reduced from 1.5 → 0.5
-# reach-v3 return differences are small — 1.5 noise was swamping the signal
-# causing RM accuracy to be stuck at ~57% (barely above random)
-# Lower noise = cleaner labels = RM can actually learn
-HUMAN_ERROR_NOISE = 0.5
+# Per friend's doc Section 6.4: σ_human_error ≤ ½ × Mean|ΔR|
+# Run label_data with --noise 0 first, check Mean|margin|, then set σ = ½ × that value
+# For reach-v3 with discounted returns, Mean|margin| ≈ 5-8, so σ ≤ 2.5
+# Start at 0.1 (very safe), increase if RM accuracy is too high (>95%)
+HUMAN_ERROR_NOISE = 0.1
 PREF_DATASET_PATH = "data/preference_dataset.pkl"
 
 # ─── Shared Network Architecture ──────────────────────────────────────────────
