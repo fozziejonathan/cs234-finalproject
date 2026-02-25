@@ -100,6 +100,7 @@ class ObsNormalizer:
 
 
 OBS_NORM_PATH = "checkpoints/obs_normalizer.npz"
+RESUME_CKPT_PATH = "checkpoints/ppo_resume.pt"  # full resume checkpoint (every 10 iters)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,8 +539,37 @@ def evaluate_policy(env, tasks, policy, obs_normalizer, n_episodes=20):
             "success_rate": float(np.mean(successes))}
 
 
+def save_resume_checkpoint(path, policy, value_net, policy_optimizer,
+                           value_optimizer, reward_normaliser, iteration, best_success):
+    torch.save({
+        "iteration": iteration,
+        "best_success": best_success,
+        "policy": policy.state_dict(),
+        "value_net": value_net.state_dict(),
+        "policy_optimizer": policy_optimizer.state_dict(),
+        "value_optimizer": value_optimizer.state_dict(),
+        "rms_mean": reward_normaliser.mean,
+        "rms_var": reward_normaliser.var,
+        "rms_count": reward_normaliser.count,
+    }, path)
+
+
+def load_resume_checkpoint(path, policy, value_net, policy_optimizer,
+                           value_optimizer, reward_normaliser):
+    ckpt = torch.load(path, map_location=DEVICE)
+    policy.load_state_dict(ckpt["policy"])
+    value_net.load_state_dict(ckpt["value_net"])
+    policy_optimizer.load_state_dict(ckpt["policy_optimizer"])
+    value_optimizer.load_state_dict(ckpt["value_optimizer"])
+    reward_normaliser.mean = ckpt["rms_mean"]
+    reward_normaliser.var = ckpt["rms_var"]
+    reward_normaliser.count = ckpt["rms_count"]
+    print(f"[INFO] Resumed from iteration {ckpt['iteration'] + 1}")
+    return ckpt["iteration"] + 1, ckpt["best_success"]  # start_iter, best_success
+
+
 def train_ppo(policy, value_net, rm, ref_policy, obs_normalizer,
-              ppo_epochs=PPO_EPOCHS, kl_coef=PPO_KL_COEF):
+              ppo_epochs=PPO_EPOCHS, kl_coef=PPO_KL_COEF, resume=False):
     ml1 = metaworld.ML1(ENV_NAME)
     env = ml1.train_classes[ENV_NAME]()
     tasks = ml1.train_tasks
@@ -548,16 +578,27 @@ def train_ppo(policy, value_net, rm, ref_policy, obs_normalizer,
     value_optimizer = optim.Adam(value_net.parameters(), lr=PPO_VALUE_LR)
     reward_normaliser = RunningMeanStd()
 
+    start_iter = 0
+    best_success = -1.0
+
+    # ── Resume from checkpoint if requested ──────────────────────────────────
+    if resume and os.path.exists(RESUME_CKPT_PATH):
+        start_iter, best_success = load_resume_checkpoint(
+            RESUME_CKPT_PATH, policy, value_net,
+            policy_optimizer, value_optimizer, reward_normaliser)
+    elif resume:
+        print("[WARN] --resume set but no checkpoint found — starting fresh.")
+
     print(f"\n{'=' * 60}")
     print(f"  Stage 2: PPO Training  ({ppo_epochs} iterations)")
+    print(f"  Starting from iteration: {start_iter}")
     print(f"  Policy lr: {PPO_LR}  |  Value lr: {PPO_VALUE_LR}")
     print(f"  Reward norm: {PPO_REWARD_NORM}  |  Value clip: {PPO_VALUE_CLIP}")
     print(f"{'=' * 60}")
 
-    best_success = -1.0
     os.makedirs(os.path.dirname(RLHF_POLICY_SAVE_PATH), exist_ok=True)
 
-    for iteration in range(ppo_epochs):
+    for iteration in range(start_iter, ppo_epochs):
         rollout = collect_ppo_rollout(
             env, tasks, policy, value_net, rm, ref_policy,
             obs_normalizer, reward_normaliser, kl_coef=kl_coef
@@ -575,9 +616,22 @@ def train_ppo(policy, value_net, rm, ref_policy, obs_normalizer,
                   f"| ret: {eval_stats['mean_return']:.2f}  "
                   f"| success: {eval_stats['success_rate']:.2%}")
 
+            # Save best policy checkpoint
             if eval_stats["mean_return"] > best_success:
                 best_success = eval_stats["mean_return"]
                 torch.save(policy.state_dict(), RLHF_POLICY_SAVE_PATH)
+
+            # Save full resume checkpoint every 10 iters
+            save_resume_checkpoint(
+                RESUME_CKPT_PATH, policy, value_net,
+                policy_optimizer, value_optimizer,
+                reward_normaliser, iteration, best_success)
+
+            # Also copy resume checkpoint to Drive for safety
+            drive_resume = "/content/drive/MyDrive/CS234_Project/checkpoints/ppo_resume.pt"
+            if os.path.exists("/content/drive"):
+                import shutil
+                shutil.copy(RESUME_CKPT_PATH, drive_resume)
 
     print(f"  Best RLHF policy saved → {RLHF_POLICY_SAVE_PATH}\n")
 
@@ -593,6 +647,8 @@ if __name__ == "__main__":
     parser.add_argument("--ppo_epochs", type=int, default=PPO_EPOCHS)
     parser.add_argument("--kl_coef", type=float, default=PPO_KL_COEF)
     parser.add_argument("--skip_rm", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume PPO from last saved checkpoint")
     args = parser.parse_args()
 
     reward_model = ContinuousRewardModel().to(DEVICE)
@@ -616,4 +672,4 @@ if __name__ == "__main__":
                            data_path=args.data, epochs=args.rm_epochs)
 
     train_ppo(policy, value_net, reward_model, ref_policy, obs_normalizer,
-              ppo_epochs=args.ppo_epochs, kl_coef=args.kl_coef)
+              ppo_epochs=args.ppo_epochs, kl_coef=args.kl_coef, resume=args.resume)
