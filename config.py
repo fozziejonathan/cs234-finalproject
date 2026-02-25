@@ -48,7 +48,7 @@ PPO_CLIP_EPS = 0.2
 # FIX 5: Reduced value coef from 0.5 → 0.25 to reduce value network's influence
 PPO_VALUE_COEF = 0.25
 # FIX 6: Increased entropy coef from 0.01 → 0.05 to prevent entropy collapse
-PPO_ENTROPY_COEF = 0.05
+PPO_ENTROPY_COEF = 0.01
 # FIX 7: Add value function clipping (same eps as policy — prevents v_loss explosion)
 PPO_VALUE_CLIP = True
 PPO_GAE_LAMBDA = 0.95
