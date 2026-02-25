@@ -39,7 +39,7 @@ RM_SAVE_PATH = "checkpoints/reward_model.pt"
 
 # FIX 4: Reduced PPO lr from 3e-4 → 1e-4 (was too aggressive, caused instability)
 PPO_LR = 1e-4
-PPO_VALUE_LR = 3e-4  # Separate (higher) lr for value network
+PPO_VALUE_LR = 1e-4  # Separate (higher) lr for value network
 PPO_EPOCHS = 300  # More iterations since we have Colab Pro A100
 PPO_STEPS = 2048  # Environment steps per PPO iteration
 PPO_MINI_BATCH = 64
