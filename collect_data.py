@@ -48,7 +48,7 @@ _POLICY_NAME_FRAGMENTS = {
     "reach-v3": "Reach",
     "push-v3": "Push",
     "pick-place-v3": "PickPlace",
-    "door-open-v3": "Door",
+    "door-open-v3": "DoorOpen",
     "drawer-open-v3": "DrawerOpen",
     "drawer-close-v3": "DrawerClose",
     "button-press-topdown-v3": "ButtonPressTopdown",

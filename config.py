@@ -6,7 +6,7 @@ All scripts import from here so hyperparameters are changed in one place.
 """
 
 # ─── Environment ──────────────────────────────────────────────────────────────
-ENV_NAME = "reach-v3"  # MetaWorld task name
+ENV_NAME = "door-open-v3"  # MetaWorld task name
 OBS_DIM = 39  # MetaWorld state space dimensionality
 ACT_DIM = 4  # 3-D Cartesian velocity + gripper
 MAX_EPISODE_STEPS = 150  # Maximum steps per episode
