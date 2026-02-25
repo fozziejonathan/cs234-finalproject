@@ -47,6 +47,9 @@ BC_TOP_FRAC = 0.30      # Only imitate top 30% of chosen trajectories by return
                          # many are still mediocre. Filter to genuinely good ones.
 BC_EVAL_EVERY = 10      # Evaluate in environment every N epochs during BC
 BC_EVAL_EPISODES = 20   # Episodes per BC eval (fast)
+BC_STD_MIN_START = 0.30 # std floor at start of BC — prevents collapse before μ converges
+BC_STD_MIN_END   = 0.05 # std floor at end of BC — allows final precision
+                         # Linearly annealed epoch 0 → BC_EPOCHS
 DPO_EVAL_EVERY = 2      # Evaluate in environment every N epochs during DPO
 DPO_EVAL_EPISODES = 20  # Episodes per DPO eval
 
@@ -304,14 +307,23 @@ def pretrain_bc(policy: ContinuousDPOPolicy, train_data: list,
         epoch_nll = 0.0
         n_batches  = 0
 
+        # Linearly anneal std floor: 0.30 → 0.05 over training.
+        # This prevents std from collapsing before μ has converged —
+        # the critical failure mode where NLL greedily shrinks σ in epoch 1
+        # and then μ can never escape the resulting near-deterministic regime.
+        frac     = epoch / max(1, epochs - 1)
+        std_min  = BC_STD_MIN_START + frac * (BC_STD_MIN_END - BC_STD_MIN_START)
+
         for start in range(0, N, batch_size):
             idx    = perm[start: start + batch_size]
             obs_b  = obs_t[idx]
             acts_b = acts_t[idx]
 
             mu, std = policy.forward(obs_b)
-            # NLL: -log N(a; μ, σ²) summed over action dims, meaned over batch
-            nll = -Normal(mu, std).log_prob(acts_b).sum(dim=-1).mean()
+            # Apply floor — keeps variance high enough for μ to stay trainable.
+            # clamp(min=std_min) only during BC; DPO uses raw forward() unchanged.
+            std_floored = std.clamp(min=std_min)
+            nll = -Normal(mu, std_floored).log_prob(acts_b).sum(dim=-1).mean()
 
             optimizer.zero_grad()
             nll.backward()
@@ -339,9 +351,9 @@ def pretrain_bc(policy: ContinuousDPOPolicy, train_data: list,
             improved = succ_stoch > best_success
             print(f"  BC Epoch {epoch + 1:>3}/{epochs}  "
                   f"| NLL: {epoch_nll / n_batches:.4f}  "
-                  f"| mean_std: {current_std:.3f}  "
-                  f"| ret: {ret_stoch:.1f}/{ret_det:.1f} (stoch/det)  "
-                  f"| success: {succ_stoch:.2%}/{succ_det:.2%} (stoch/det)"
+                  f"| floor: {std_min:.3f}  actual_std: {current_std:.3f}  "
+                  f"| ret: {ret_stoch:.1f}/{ret_det:.1f} (s/d)  "
+                  f"| success: {succ_stoch:.2%}/{succ_det:.2%} (s/d)"
                   + (" ← best" if improved else ""))
 
             if improved:
