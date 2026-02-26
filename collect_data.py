@@ -60,6 +60,12 @@ def _get_scripted_policy(env_name):
 def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
     ml1    = metaworld.ML1(env_name)
     env    = ml1.train_classes[env_name]()
+
+    # Un-hide the goal so the scripted expert policy can see it
+    env._partially_observable = False
+    env._freeze_rand_vec = False
+    env._set_task_called = True
+
     tasks  = ml1.train_tasks
     policy = _get_scripted_policy(env_name)
 
