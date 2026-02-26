@@ -30,17 +30,18 @@ from config import ENV_NAME, MAX_EPISODE_STEPS, RAW_DATA_PATH
 
 # ── Policy lookup ─────────────────────────────────────────────────────────────
 _POLICY_FRAGMENTS = {
-    "reach-v3":                  "Reach",
-    "push-v3":                   "Push",
-    "pick-place-v3":             "PickPlace",
-    "door-open-v3":              "DoorOpen",
-    "drawer-open-v3":            "DrawerOpen",
-    "drawer-close-v3":           "DrawerClose",
-    "button-press-topdown-v3":   "ButtonPressTopdown",
-    "peg-insert-side-v3":        "PegInsertionSide",
-    "window-open-v3":            "WindowOpen",
-    "window-close-v3":           "WindowClose",
+    "reach-v3": "Reach",
+    "push-v3": "Push",
+    "pick-place-v3": "PickPlace",
+    "door-open-v3": "DoorOpen",
+    "drawer-open-v3": "DrawerOpen",
+    "drawer-close-v3": "DrawerClose",
+    "button-press-topdown-v3": "ButtonPressTopdown",
+    "peg-insert-side-v3": "PegInsertionSide",
+    "window-open-v3": "WindowOpen",
+    "window-close-v3": "WindowClose",
 }
+
 
 def _get_scripted_policy(env_name):
     all_names = [n for n in dir(mw_policies) if "Policy" in n]
@@ -58,19 +59,13 @@ def _get_scripted_policy(env_name):
 
 
 def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
-    ml1    = metaworld.ML1(env_name)
-    env    = ml1.train_classes[env_name]()
-
-    # Un-hide the goal so the scripted expert policy can see it
-    env._partially_observable = False
-    env._freeze_rand_vec = False
-    env._set_task_called = True
-
-    tasks  = ml1.train_tasks
-    policy = _get_scripted_policy(env_name)
+    ml1 = metaworld.ML1(env_name)
+    env = ml1.train_classes[env_name]()
+    tasks = ml1.train_tasks
 
     os.makedirs(os.path.dirname(out) if os.path.dirname(out) else ".", exist_ok=True)
     print(f"[INFO] Collecting {n} trajectories  env={env_name}  noise={noise}")
+    print(f"[INFO] Using proportional controller (scripted policy is broken for reach-v3)")
     print(f"[INFO] Saving → {out}")
 
     returns, successes = [], []
@@ -84,10 +79,8 @@ def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
             ep_success = False
 
             for _ in range(MAX_EPISODE_STEPS):
-                if policy is not None:
-                    base = policy.get_action(obs)
-                else:
-                    base = env.action_space.sample()
+                delta = env._target_pos - obs[0:3]
+                base = np.append(delta * 3.0, 0.0)
                 action = np.clip(
                     base + np.random.normal(0.0, noise, size=base.shape),
                     env.action_space.low, env.action_space.high
@@ -114,14 +107,14 @@ def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
 
             grp = f.create_group(f"trajectory_{i}")
             grp.create_dataset("observations", data=np.array(obs_buf))
-            grp.create_dataset("actions",      data=np.array(act_buf))
-            grp.create_dataset("rewards",      data=np.array(rew_buf, dtype=np.float32))
-            grp.create_dataset("dones",        data=np.array(done_buf))
-            grp.attrs["success"]   = ep_success
+            grp.create_dataset("actions", data=np.array(act_buf))
+            grp.create_dataset("rewards", data=np.array(rew_buf, dtype=np.float32))
+            grp.create_dataset("dones", data=np.array(done_buf))
+            grp.attrs["success"] = ep_success
             grp.attrs["ep_return"] = ep_return
 
             if (i + 1) % 500 == 0:
-                print(f"  [{i+1:>5}/{n}]  "
+                print(f"  [{i + 1:>5}/{n}]  "
                       f"mean_return: {np.mean(returns[-500:]):.2f}  "
                       f"success_rate: {np.mean(successes[-500:]):.2%}")
 
@@ -137,9 +130,9 @@ def collect(env_name=ENV_NAME, n=5000, noise=0.02, out=RAW_DATA_PATH):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",   default=ENV_NAME)
-    parser.add_argument("--n",     type=int,   default=5000)
+    parser.add_argument("--env", default=ENV_NAME)
+    parser.add_argument("--n", type=int, default=5000)
     parser.add_argument("--noise", type=float, default=0.02)
-    parser.add_argument("--out",   default=RAW_DATA_PATH)
+    parser.add_argument("--out", default=RAW_DATA_PATH)
     args = parser.parse_args()
     collect(args.env, args.n, args.noise, args.out)
