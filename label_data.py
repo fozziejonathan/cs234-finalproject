@@ -1,18 +1,14 @@
 """
 label_data.py
 -------------
-Phase 2: Preference Dataset
+Builds preference pairs from raw trajectories.
 
-Reads trajectories from collect_data.py and builds preference pairs using
-actual environment returns.
+Labels:
+  success vs. failure   → label 1.0
+  success vs. success   → label 1.0 (higher return wins)
+  failure vs. failure   → label 0.5 (no preference)
 
-Each pair stores success flag so BC can filter to successful demos only.
-
-Output: data/preference_dataset.pkl
-    {
-      "train": [ {chosen: {...}, rejected: {...}, margin: float}, ... ],
-      "val":   [ ... ]
-    }
+Output: pkl with {"train": [...], "val": [...]}
 """
 
 import argparse

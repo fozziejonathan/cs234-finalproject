@@ -1,61 +1,21 @@
 """
 train_rlhf.py
 -------------
-RLHF fine-tuning of a pre-trained BC policy.
+RLHF fine-tuning of a BC policy.
 
-  Stage 1 — Bradley-Terry Reward Model
-  Stage 2 — Reward-Weighted Regression (RWR) policy fine-tuning
+Stage 1: Train a Bradley-Terry reward model on preference pairs.
+Stage 2: Reward-Weighted Regression (RWR) — weighted MLE over existing
+         trajectories using exp(R_norm(τ) / β) as weights. This is the
+         closed-form solution to max_π E_π[R] - β·KL(π ‖ π_BC), so no
+         rollouts or RL updates needed.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Why RLHF fine-tunes instead of trains from scratch
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The KL-regularized RL objective is:
+Usage:
+    python train_rlhf.py --data data/preferences_....pkl
+    python train_rlhf.py --data data/preferences_....pkl --skip_rm
 
-    max_π  E_π[R(τ)]  −  β · KL( π ‖ π_ref )
-
-Peters & Schaal (2007) show this has a closed-form optimal solution:
-
-    π*(a|s)  ∝  π_ref(a|s) · exp( r(s,a) / β )
-
-When π_ref = π_BC, the BC policy is the reference, and the optimum is
-just a re-weighted version of BC. You do not need to search the entire
-policy space from scratch — you only need to nudge π_BC toward
-trajectories that receive high reward from the learned reward model.
-
-RWR implements this by treating the weights exp(R(τ)/β) as fixed
-scalars and solving the resulting weighted maximum-likelihood problem:
-
-    θ* = argmax_θ  Σ_τ  exp(R(τ)/β) · log π_θ(τ)
-
-This is pure supervised learning (no RL loops, no value functions,
-no on-policy rollouts) with the BC policy as the warm start.
-
-The β temperature controls how aggressively the policy departs from BC:
-  β → ∞ : all weights → 1 (equivalent to plain BC, no change)
-  β → 0 : winner-take-all (only the single best trajectory survives)
-A finite β keeps the policy close to BC while preferring high-reward
-trajectories, which is exactly what you want for fine-tuning.
-
-References
-----------
-Christiano et al. (2017)  — Deep RL from Human Preferences (Bradley-Terry RM)
-Peters & Schaal (2007)    — Reinforcement Learning by Reward-Weighted Regression
-Peng et al. (2019) / AWR  — Advantage-Weighted Regression (extends RWR offline)
-Dong et al. (2023)        — Aligning LMs with Offline Learning from Human Feedback
-                            (arXiv 2308.12050) — reward normalization before weighting
-
-Usage
------
-    # Train both RM and RWR from scratch:
-    python train_rlhf.py --data data/preferences_bin-picking-v3_20seeds_10000.pkl
-
-    # Skip RM training (reuse saved checkpoint):
-    python train_rlhf.py --data data/preferences_... --skip_rm
-
-Outputs
--------
-    checkpoints/rm_{ENV_NAME}.pt          — frozen reward model
-    checkpoints/rlhf_policy_{ENV_NAME}.pt — best RWR-fine-tuned policy
+Outputs:
+    checkpoints/rm_{ENV_NAME}.pt
+    checkpoints/rlhf_policy_{ENV_NAME}.pt
 """
 
 import argparse
@@ -100,19 +60,12 @@ EVAL_EPS   = 100
 
 class RewardModel(nn.Module):
     """
-    r_φ(s, a) → scalar reward.
+    r_φ(s, a) → scalar reward. Two-layer MLP, mean-pooled over trajectory steps.
 
-    Architecture: two-hidden-layer MLP, same hidden dim as the BC policy.
-    Input : (obs, action) concatenated — shape (T, obs_dim + act_dim)
-    Output: scalar — mean of per-step rewards over the trajectory
+    Input : (obs, action) concatenated — (T, obs_dim + act_dim)
+    Output: scalar mean reward over the trajectory
 
-    Mean-pooling over timesteps (not sum) prevents longer trajectories
-    from receiving artificially high/low scores relative to short ones,
-    which matters in MetaWorld where episodes terminate early on success.
-
-    Training objective (Bradley-Terry model, Christiano et al. 2017):
-        L = -log σ( R(τ_chosen) − R(τ_rejected) )
-    where R(τ) = (1/T) Σ_t r_φ(s_t, a_t).
+    Bradley-Terry loss: L = -log σ( R(τ_chosen) − R(τ_rejected) )
     """
 
     def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden_dim=HIDDEN_DIM):
@@ -150,17 +103,7 @@ def _to_tensors(pair_side, obs_norm):
 
 def train_reward_model(rm, train_data, val_data, obs_norm,
                        epochs=RM_EPOCHS, lr=RM_LR, batch_size=RM_BATCH):
-    """
-    Train the reward model with the Bradley-Terry objective.
-
-    Only hard-label pairs (label=1.0) are used. Soft-label pairs
-    (label=0.5, both trajectories failed) are discarded because they
-    carry no preference signal — using them would add noise to the
-    gradient and could push the RM to assign arbitrary ordering to
-    pairs where neither trajectory is preferred.
-
-    Reference: Christiano et al. (2017), Section 2.2.
-    """
+    """Train the RM on hard-label pairs only (label=1.0). Soft pairs skipped."""
     train_hard = [p for p in train_data if p["label"] == 1.0]
     val_hard   = [p for p in val_data   if p["label"] == 1.0]
 
@@ -250,28 +193,12 @@ def train_reward_model(rm, train_data, val_data, obs_norm,
 
 def _score_all_trajectories(rm, train_data, obs_norm):
     """
-    Score every trajectory that appears in the hard-label training pairs
-    using the frozen reward model, and compute normalized RWR weights.
+    Score all trajectories in hard-label pairs with the frozen RM.
+    Scores both chosen and rejected so low-reward trajectories get
+    down-weighted in RWR rather than ignored.
+    Reward is normalized (zero mean, unit std) before returning.
 
-    Both chosen and rejected sides of each pair are scored. This is correct:
-    the RWR update should see the full distribution of behaviors that the
-    BC policy produced, not just the winners, so that low-reward trajectories
-    are down-weighted rather than silently ignored.
-
-    Reward normalization (subtract mean, divide std) is applied before
-    computing exp weights. This decouples the weight scale from the reward
-    model's absolute output range so that the temperature β has a consistent
-    interpretation regardless of the RM's scale.
-    Reference: Dong et al. (2023), arXiv 2308.12050, Section 3.
-
-    Returns
-    -------
-    list of dicts, each containing:
-        obs_n   : (T, obs_dim) float32 ndarray, already normalized
-        acts    : (T, act_dim) float32 ndarray
-        reward  : float, raw RM score
-        reward_norm : float, normalized RM score
-        success : bool
+    Returns list of dicts: {obs_n, acts, reward, reward_norm, success}
     """
     hard_pairs = [p for p in train_data if p["label"] == 1.0]
     trajs = []
@@ -310,36 +237,13 @@ def _score_all_trajectories(rm, train_data, obs_norm):
 def train_rwr(policy, rm, train_data, val_data, obs_norm,
               epochs=RWR_EPOCHS, lr=RWR_LR, beta=RWR_BETA):
     """
-    Fine-tune the BC policy with Reward-Weighted Regression (RWR).
+    Fine-tune BC with Reward-Weighted Regression.
 
-    Algorithm (Peters & Schaal, 2007)
-    ----------------------------------
-    Given fixed weights  w_i = exp( R_norm(τ_i) / β ):
-
+    Weighted MLE with w_i = exp(R_norm(τ_i) / β):
         θ* = argmax_θ  Σ_i  w_i · log π_θ(τ_i)
 
-    This is exactly the weighted MLE problem, which is standard
-    supervised learning with per-sample importance weights.  The RM
-    is frozen — there are no on-policy rollouts, no value functions,
-    and no RL update rules. The entire fine-tuning stage is a
-    weighted regression over the existing trajectory dataset.
-
-    Connection to KL-regularized RL (why this is principled fine-tuning)
-    ----------------------------------------------------------------------
-    The above objective is the exact solution to:
-
-        max_π  E_π[R(τ)]  −  β · KL( π ‖ π_BC )
-
-    (Peters & Schaal 2007; Peng et al. 2019).  Setting π_ref = π_BC means:
-      (a) We never stray far from the behavior the BC policy already learned.
-      (b) The only parts of the policy that change are those where the RM
-          provides a clear signal (high vs. low reward trajectories differ).
-      (c) The warm-start from BC weights means the weighted MLE converges
-          quickly — we are already in a good region of parameter space.
-
-    This is fundamentally different from training RLHF from scratch, where
-    π_ref would be a random policy and the KL penalty would have nothing
-    useful to anchor to.
+    This is the closed-form solution to max_π E_π[R] - β·KL(π ‖ π_BC).
+    No rollouts needed — pure weighted supervised learning over existing data.
     """
     trajs = _score_all_trajectories(rm, train_data, obs_norm)
 

@@ -1,20 +1,15 @@
 """
 train_dpo.py
 ------------
-Stage 1: DPO fine-tuning of a pre-trained BC policy.
+DPO fine-tuning of a BC policy.
 
-Loads the BC checkpoint and obs normalizer produced by train_bc.py, then
-fine-tunes against a frozen copy of that same policy (the reference) using
-preference pairs from label_data.py.
+Fine-tunes against a frozen copy of the BC policy as reference.
+Hard-label pairs only (label=1.0, success vs. failure).
 
-Loss: standard DPO contrastive loss
-    L = -log σ( β*(log π(τ_w) - log π_ref(τ_w)) - β*(log π(τ_l) - log π_ref(τ_l)) )
-
-Soft-label pairs (label=0.5, both trajectories failed) are skipped — they
-carry no preference signal and add noise to the DPO gradient.
+Loss: -log σ( β*(log π(τ_w) - log π_ref(τ_w)) - β*(log π(τ_l) - log π_ref(τ_l)) )
 
 Outputs:
-    checkpoints/dpo_policy_{ENV_NAME}.pt
+    checkpoints/dpo_policy_{ENV_NAME}.pt   (or dpop_policy with --dpop)
 """
 
 import argparse

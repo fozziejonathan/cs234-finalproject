@@ -1,25 +1,19 @@
 """
 train_bc.py
 -----------
-Stage 0: Behavioral Cloning (BC) on successful expert demonstrations.
+Stage 0: Behavioral Cloning on successful expert demonstrations.
 
 Loss:   MSE( μ_θ(s), a_expert )
-Data:   Successful trajectories loaded directly from the raw h5 file
-        produced by collect_data.py. Training on the h5 directly avoids
-        the duplication introduced by the preference pairing process, where
-        the same trajectory can appear as 'chosen' in multiple pairs.
+Data:   Successful trajectories from the h5 produced by collect_data.py.
+        Loaded directly to avoid duplication from preference pairing.
 
-Architecture note — log_std as nn.Parameter (not a frozen buffer):
-    MSE has no gradient signal for log_std, so it stays near its
-    initialization (-1.0 → std ≈ 0.37) throughout BC. However, making it
-    a proper trainable parameter means DPO and RLHF can both unfreeze it
-    during fine-tuning without any architectural mismatch. This follows the
-    PPO/TRPO convention of a state-independent learned log_std.
-    See: OpenAI SpinningUp docs; Schulman et al. (PPO, 2017).
+log_std is a trainable parameter but gets no gradient signal under MSE —
+it stays near its init (-1.0 → std ≈ 0.37). Keeping it as a parameter
+lets DPO/RLHF update it freely without checkpoint surgery.
 
-Outputs (saved as a paired unit — never load one without the other):
+Outputs (always load as a pair):
     checkpoints/bc_policy.pt        — policy weights
-    checkpoints/obs_normalizer.npz  — per-dim mean/std fit on training obs
+    checkpoints/obs_normalizer.npz  — per-dim mean/std
 """
 
 import os
@@ -63,13 +57,7 @@ print(f"[INFO] Device: {DEVICE}")
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ObsNormalizer:
-    """
-    Fits per-dimension mean and std from training observations,
-    then normalizes to zero mean and unit variance.
-
-    Must be saved alongside the policy checkpoint — the network weights
-    are only valid for inputs normalized with these exact statistics.
-    """
+    """Per-dim mean/std normalization. Must be saved alongside the policy checkpoint."""
 
     def __init__(self):
         self.mean = self.std = None
@@ -103,19 +91,9 @@ class GaussianPolicy(nn.Module):
     """
     π(a|s) = N( μ_θ(s), σ²I )
 
-    μ_θ: two-hidden-layer MLP (39 → 256 → 256 → 4).
-    σ:   global, state-independent, learned scalar per action dim.
-         Initialized to LOG_STD_INIT; MSE training leaves it unchanged.
-         DPO and RLHF fine-tuning are free to update it.
-
-    Architecture choices:
-        - LayerNorm after the first linear layer: stabilizes activations
-          for MetaWorld's heterogeneous 39-dim obs space (XYZ, quaternions,
-          zeroed object dims). Acts as a second line of defense after
-          obs normalization. See Ba et al. (2016); Kostrikov et al. (2021).
-        - Orthogonal initialization: standard for on-policy RL (PPO paper).
-        - Small gain (0.01) on the output head: keeps initial actions near
-          zero, matching the scripted policy's typical starting magnitude.
+    μ_θ: MLP (39 → 256 → 256 → 4) with LayerNorm after first layer.
+    σ:   global learned scalar per action dim, initialized to LOG_STD_INIT.
+         Orthogonal init throughout; small gain (0.01) on output head.
     """
 
     def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden_dim=HIDDEN_DIM):
@@ -155,13 +133,7 @@ class GaussianPolicy(nn.Module):
         return action.squeeze(0).cpu().numpy()
 
     def traj_log_prob(self, obs_seq: torch.Tensor, act_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Sum of per-step log-probs normalized by episode length.
-        Used by DPO fine-tuning; defined here so the checkpoint is
-        self-contained.
-
-        log π(τ) = Σ_t log π(a_t | s_t) / T
-        """
+        """Mean log-prob over trajectory steps: Σ_t log π(a_t|s_t) / T"""
         mu, std = self.forward(obs_seq)
         step_lp = Normal(mu, std).log_prob(act_seq).sum(dim=-1)  # (T,)
         T = obs_seq.shape[0]
@@ -225,12 +197,8 @@ def env_eval(policy: GaussianPolicy, obs_norm: ObsNormalizer,
              n_episodes: int = None,
              deterministic: bool = True):
     """
-    Roll out the policy across EVAL_SEEDS × EVAL_EPS_PER_SEED episodes and
-    return (mean_return, success_rate).  Each seed produces a different set of
-    50 task configurations, so 3 seeds × 50 episodes = 150 distinct tasks.
-
-    n_episodes is ignored (kept for API compatibility) — episode count is
-    always EVAL_SEEDS × EVAL_EPS_PER_SEED.
+    Evaluate over EVAL_SEEDS × EVAL_EPS_PER_SEED episodes.
+    Returns (mean_return, success_rate). n_episodes is ignored.
     """
     policy.eval()
     returns, successes = [], []
@@ -280,18 +248,11 @@ def env_eval(policy: GaussianPolicy, obs_norm: ObsNormalizer,
 
 def train_bc(policy: GaussianPolicy, h5_path: str, obs_norm: ObsNormalizer,
              epochs: int = BC_EPOCHS, lr: float = BC_LR, batch: int = BC_BATCH):
-    """
-    Minimize MSE( μ_θ(s), a_expert ) on successful demonstrations.
-
-    Checkpointing: saves the weights that achieve the best deterministic
-    success rate during training (not just the final weights).
-    """
+    """MSE on successful demonstrations. Saves best checkpoint by success rate."""
     obs_t, acts_t, obs_val, acts_val = load_bc_data_from_h5(h5_path, obs_norm)
     N = len(obs_t)
 
-    # log_std has no gradient signal under MSE, but including it in the
-    # optimizer keeps the interface consistent — downstream fine-tuning
-    # doesn't need to reconstruct the optimizer from scratch.
+    # log_std gets no gradient under MSE, but kept in optimizer for downstream fine-tuning
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -385,8 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=BC_BATCH)
     args = parser.parse_args()
 
-    # ── Fit obs normalizer on ALL h5 observations (success + fail) ────────────
-    # Covers the full distribution the policy will see during fine-tuning.
+    # fit on all obs (success + fail) to cover full distribution
     print(f"[INFO] Fitting obs normalizer from {args.h5}")
     with h5py.File(args.h5, "r") as f:
         all_obs = np.concatenate(

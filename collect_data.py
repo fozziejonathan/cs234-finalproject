@@ -1,26 +1,17 @@
 """
 collect_data.py
 ---------------
-Phase 1: Trajectory Collection
+Trajectory collection for MetaWorld.
 
-Supports two collection modes:
-  1. Scripted expert (default) — deterministic, no noise.
-  2. BC policy (--bc_ckpt) — stochastic rollouts from a trained GaussianPolicy
-     checkpoint. Use this to generate on-policy preference data for DPO
-     fine-tuning. Stochastic rollouts are essential so that the BC policy
-     produces both successes and failures, giving DPO a clean preference signal.
-
-For BC rollouts, use --n_rollouts_per_task to run each task configuration
-multiple times. Each run produces a different trajectory due to stochasticity,
-giving you natural variance (successes and failures) on the same goal/object
-placement. This is the cleanest possible preference signal for DPO since the
-only thing varying between paired trajectories is the policy's behavior, not
-the environment setup.
+Two modes:
+  1. Scripted expert (default) — deterministic.
+  2. BC policy (--bc_ckpt) — stochastic rollouts from a trained checkpoint.
+     Use --n_rollouts_per_task to get multiple outcomes per task config
+     (some successes, some failures) for DPO preference data.
 
 Output filenames:
   Scripted : data/raw_trajectories_{env}_{n}seeds.h5
   BC policy: data/raw_trajectories_{env}_{n}seeds_{r}rpt_bc.h5
-             where rpt = rollouts per task
 """
 
 import argparse
@@ -91,12 +82,8 @@ def _load_bc_policy(ckpt_path, obs_norm_path):
 
 class BCPolicyWrapper:
     """
-    Thin wrapper so BC policy has the same .get_action(obs) interface
-    as the MetaWorld scripted policies.
-
-    Always samples stochastically (deterministic=False) so that repeated
-    rollouts on the same task produce different trajectories — some successes,
-    some failures — which is exactly what DPO needs.
+    Wraps BC policy to match MetaWorld scripted policy interface.
+    Always samples stochastically so repeated rollouts on the same task vary.
     """
 
     def __init__(self, policy, obs_norm):
