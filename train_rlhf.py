@@ -1,113 +1,120 @@
 """
 train_rlhf.py
 -------------
-Phase 3: Reinforcement Learning from Human Feedback (RLHF)
+RLHF fine-tuning of a pre-trained BC policy.
 
-Fixes applied (v3):
-    1. Global observation normalization — compute mean/std from dataset,
-       normalize all obs before feeding to RM and policy. Fixes dying ReLU
-       caused by heterogeneous 39-dim MetaWorld obs space.
-    2. Mean pooling in Bradley-Terry loss — .mean() instead of .sum().
-       Prevents sigmoid saturation (logit 7.5 → gradient 0.0006).
-    3. Mini-batch DataLoader for RM training — batch_size=64 instead of 1.
-       Stabilizes Adam gradients and restores LayerNorm validity.
-    4. Separate optimizers for policy/value (carried over from v2).
-    5. Value loss clipping (carried over from v2).
-    6. Running reward normalization (carried over from v2).
+  Stage 1 — Bradley-Terry Reward Model
+  Stage 2 — Reward-Weighted Regression (RWR) policy fine-tuning
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Why RLHF fine-tunes instead of trains from scratch
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The KL-regularized RL objective is:
+
+    max_π  E_π[R(τ)]  −  β · KL( π ‖ π_ref )
+
+Peters & Schaal (2007) show this has a closed-form optimal solution:
+
+    π*(a|s)  ∝  π_ref(a|s) · exp( r(s,a) / β )
+
+When π_ref = π_BC, the BC policy is the reference, and the optimum is
+just a re-weighted version of BC. You do not need to search the entire
+policy space from scratch — you only need to nudge π_BC toward
+trajectories that receive high reward from the learned reward model.
+
+RWR implements this by treating the weights exp(R(τ)/β) as fixed
+scalars and solving the resulting weighted maximum-likelihood problem:
+
+    θ* = argmax_θ  Σ_τ  exp(R(τ)/β) · log π_θ(τ)
+
+This is pure supervised learning (no RL loops, no value functions,
+no on-policy rollouts) with the BC policy as the warm start.
+
+The β temperature controls how aggressively the policy departs from BC:
+  β → ∞ : all weights → 1 (equivalent to plain BC, no change)
+  β → 0 : winner-take-all (only the single best trajectory survives)
+A finite β keeps the policy close to BC while preferring high-reward
+trajectories, which is exactly what you want for fine-tuning.
+
+References
+----------
+Christiano et al. (2017)  — Deep RL from Human Preferences (Bradley-Terry RM)
+Peters & Schaal (2007)    — Reinforcement Learning by Reward-Weighted Regression
+Peng et al. (2019) / AWR  — Advantage-Weighted Regression (extends RWR offline)
+Dong et al. (2023)        — Aligning LMs with Offline Learning from Human Feedback
+                            (arXiv 2308.12050) — reward normalization before weighting
+
+Usage
+-----
+    # Train both RM and RWR from scratch:
+    python train_rlhf.py --data data/preferences_bin-picking-v3_20seeds_10000.pkl
+
+    # Skip RM training (reuse saved checkpoint):
+    python train_rlhf.py --data data/preferences_... --skip_rm
+
+Outputs
+-------
+    checkpoints/rm_{ENV_NAME}.pt          — frozen reward model
+    checkpoints/rlhf_policy_{ENV_NAME}.pt — best RWR-fine-tuned policy
 """
 
 import argparse
 import os
-import copy
 import pickle
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Normal
-import metaworld
 
 from config import (
-    ENV_NAME, OBS_DIM, ACT_DIM, MAX_EPISODE_STEPS,
-    HIDDEN_DIM, PREF_DATASET_PATH,
-    RM_LR, RM_EPOCHS, RM_MIN_VAL_ACC, RM_WEIGHT_DECAY, RM_SAVE_PATH,
-    PPO_LR, PPO_VALUE_LR, PPO_EPOCHS, PPO_STEPS, PPO_MINI_BATCH,
-    PPO_OPT_EPOCHS, PPO_CLIP_EPS, PPO_VALUE_COEF, PPO_ENTROPY_COEF,
-    PPO_VALUE_CLIP, PPO_GAE_LAMBDA, PPO_GAMMA, PPO_KL_COEF,
-    PPO_MAX_GRAD_NORM, PPO_REWARD_NORM, RLHF_POLICY_SAVE_PATH,
+    ENV_NAME, OBS_DIM, ACT_DIM, HIDDEN_DIM,
 )
+from train_bc import GaussianPolicy, ObsNormalizer, env_eval, DEVICE
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[INFO] Running on device: {DEVICE}")
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BC_CKPT       = f"checkpoints/bc_policy_{ENV_NAME}.pt"
+OBS_NORM_PATH = f"checkpoints/obs_normalizer_{ENV_NAME}.npz"
+RM_SAVE_PATH  = f"checkpoints/rm_{ENV_NAME}.pt"
+RWR_SAVE_PATH = f"checkpoints/rlhf_policy_{ENV_NAME}.pt"
 
-RM_BATCH_SIZE = 64  # FIX 3: mini-batch size for RM training
+# ── Hyperparameters ────────────────────────────────────────────────────────────
+RM_EPOCHS  = 20
+RM_LR      = 3e-4
+RM_BATCH   = 32    # preference pairs per gradient step
+
+RWR_EPOCHS = 20
+RWR_LR     = 1e-4
+RWR_BATCH  = 32    # trajectories per gradient step
+RWR_BETA   = 1.0   # temperature β: lower = more aggressive re-weighting
+
+EVAL_EVERY = 1
+EVAL_EPS   = 100
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 1: Observation Normalizer
-# Computes per-dimension mean and std from the full dataset and normalizes
-# all observations before they enter any neural network.
-# Must be fit on training data and then frozen for PPO rollouts.
+# Stage 1: Bradley-Terry Reward Model
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ObsNormalizer:
+class RewardModel(nn.Module):
     """
-    Fits per-dimension (mean, std) statistics from the preference dataset,
-    then normalizes observations to zero mean and unit variance.
+    r_φ(s, a) → scalar reward.
 
-    Why this matters: MetaWorld's 39-dim obs mixes XYZ coords (~0.5 scale),
-    quaternions ([-1,1]), and permanently zeroed dims for unused objects.
-    Without normalization the first linear layer is dominated by high-magnitude
-    dims, causing dying ReLU with orthogonal initialization.
+    Architecture: two-hidden-layer MLP, same hidden dim as the BC policy.
+    Input : (obs, action) concatenated — shape (T, obs_dim + act_dim)
+    Output: scalar — mean of per-step rewards over the trajectory
+
+    Mean-pooling over timesteps (not sum) prevents longer trajectories
+    from receiving artificially high/low scores relative to short ones,
+    which matters in MetaWorld where episodes terminate early on success.
+
+    Training objective (Bradley-Terry model, Christiano et al. 2017):
+        L = -log σ( R(τ_chosen) − R(τ_rejected) )
+    where R(τ) = (1/T) Σ_t r_φ(s_t, a_t).
     """
 
-    def __init__(self):
-        self.mean = None
-        self.std = None
-
-    def fit(self, dataset: list):
-        """Compute stats from all observations in the preference dataset."""
-        all_obs = []
-        for pair in dataset:
-            all_obs.append(pair["chosen"]["observations"])
-            all_obs.append(pair["rejected"]["observations"])
-        all_obs = np.concatenate(all_obs, axis=0)  # (N*T, 39)
-        self.mean = all_obs.mean(axis=0).astype(np.float32)
-        self.std = all_obs.std(axis=0).astype(np.float32)
-        self.std = np.clip(self.std, 1e-8, None)  # prevent division by zero
-        print(f"[INFO] ObsNormalizer fit on {len(all_obs):,} observations.")
-        print(f"[INFO] Obs mean range: [{self.mean.min():.3f}, {self.mean.max():.3f}]")
-        print(f"[INFO] Obs std range:  [{self.std.min():.3f},  {self.std.max():.3f}]")
-
-    def normalize(self, obs: np.ndarray) -> np.ndarray:
-        return (obs - self.mean) / self.std
-
-    def normalize_tensor(self, obs_t: torch.Tensor) -> torch.Tensor:
-        mean_t = torch.FloatTensor(self.mean).to(obs_t.device)
-        std_t = torch.FloatTensor(self.std).to(obs_t.device)
-        return (obs_t - mean_t) / std_t
-
-    def save(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez(path, mean=self.mean, std=self.std)
-
-    def load(self, path: str):
-        data = np.load(path)
-        self.mean = data["mean"].astype(np.float32)
-        self.std = data["std"].astype(np.float32)
-
-
-OBS_NORM_PATH = "checkpoints/obs_normalizer.npz"
-RESUME_CKPT_PATH = "checkpoints/ppo_resume.pt"  # full resume checkpoint (every 10 iters)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Neural Network Architectures
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ContinuousRewardModel(nn.Module):
     def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden_dim=HIDDEN_DIM):
         super().__init__()
         self.net = nn.Sequential(
@@ -117,67 +124,6 @@ class ContinuousRewardModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, obs, action):
-        x = torch.cat([obs, action], dim=-1)
-        return self.net(x).squeeze(-1)
-
-
-class ContinuousGaussianPolicy(nn.Module):
-    def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden_dim=HIDDEN_DIM):
-        super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.mu_head = nn.Linear(hidden_dim, act_dim)
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-        nn.init.orthogonal_(self.mu_head.weight, gain=0.01)
-
-    def forward(self, obs):
-        features = self.trunk(obs)
-        mu = self.mu_head(features)
-        std = torch.exp(torch.clamp(self.log_std, -2.0, 2.0)).expand_as(mu)
-        return mu, std
-
-    def get_action_and_logprob(self, obs, action=None):
-        mu, std = self.forward(obs)
-        dist = Normal(mu, std)
-        if action is None:
-            action = dist.rsample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
-        return action, log_prob, entropy
-
-    def get_logprob(self, obs, action):
-        mu, std = self.forward(obs)
-        return Normal(mu, std).log_prob(action).sum(dim=-1)
-
-
-class ValueNetwork(nn.Module):
-    def __init__(self, obs_dim=OBS_DIM, hidden_dim=HIDDEN_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
         for m in self.modules():
@@ -185,455 +131,310 @@ class ValueNetwork(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, obs):
-        return self.net(obs).squeeze(-1)
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """
+        obs : (T, obs_dim)   act : (T, act_dim)
+        returns scalar — mean reward across the T timesteps.
+        """
+        x = torch.cat([obs, act], dim=-1)       # (T, obs_dim + act_dim)
+        return self.net(x).squeeze(-1).mean()   # scalar
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIX 3: PyTorch Dataset for mini-batch RM training
-# ══════════════════════════════════════════════════════════════════════════════
-
-class PreferenceDataset(Dataset):
-    """Wraps preference pairs for use with PyTorch DataLoader."""
-
-    def __init__(self, pairs: list, obs_normalizer: ObsNormalizer):
-        self.pairs = pairs
-        self.obs_normalizer = obs_normalizer
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        pair = self.pairs[idx]
-        obs_w = self.obs_normalizer.normalize(
-            pair["chosen"]["observations"].astype(np.float32))
-        act_w = pair["chosen"]["actions"].astype(np.float32)
-        obs_l = self.obs_normalizer.normalize(
-            pair["rejected"]["observations"].astype(np.float32))
-        act_l = pair["rejected"]["actions"].astype(np.float32)
-        return (torch.FloatTensor(obs_w), torch.FloatTensor(act_w),
-                torch.FloatTensor(obs_l), torch.FloatTensor(act_l))
+def _to_tensors(pair_side, obs_norm):
+    """Normalize obs and move obs/acts to DEVICE for one trajectory."""
+    obs_n = obs_norm.normalize(pair_side["observations"].astype(np.float32))
+    obs_t = torch.FloatTensor(obs_n).to(DEVICE)
+    act_t = torch.FloatTensor(pair_side["actions"].astype(np.float32)).to(DEVICE)
+    return obs_t, act_t
 
 
-def collate_preference_batch(batch):
-    """Stack variable-length trajectory tensors into padded batches."""
-    obs_w_list, act_w_list, obs_l_list, act_l_list = zip(*batch)
-    return obs_w_list, act_w_list, obs_l_list, act_l_list
+def train_reward_model(rm, train_data, val_data, obs_norm,
+                       epochs=RM_EPOCHS, lr=RM_LR, batch_size=RM_BATCH):
+    """
+    Train the reward model with the Bradley-Terry objective.
 
+    Only hard-label pairs (label=1.0) are used. Soft-label pairs
+    (label=0.5, both trajectories failed) are discarded because they
+    carry no preference signal — using them would add noise to the
+    gradient and could push the RM to assign arbitrary ordering to
+    pairs where neither trajectory is preferred.
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Running Reward Normaliser
-# ══════════════════════════════════════════════════════════════════════════════
+    Reference: Christiano et al. (2017), Section 2.2.
+    """
+    train_hard = [p for p in train_data if p["label"] == 1.0]
+    val_hard   = [p for p in val_data   if p["label"] == 1.0]
 
-class RunningMeanStd:
-    def __init__(self, epsilon=1e-4):
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = epsilon
-
-    def update(self, x: np.ndarray):
-        batch_mean = np.mean(x)
-        batch_var = np.var(x)
-        batch_count = len(x)
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-        self.mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
-        self.var = m2 / tot_count
-        self.count = tot_count
-
-    def normalise(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 1: Reward Model Training
-# ══════════════════════════════════════════════════════════════════════════════
-
-def train_reward_model(rm, obs_normalizer, data_path=PREF_DATASET_PATH,
-                       epochs=RM_EPOCHS, lr=RM_LR):
-    with open(data_path, "rb") as f:
-        dataset_dict = pickle.load(f)
-    train_data = dataset_dict["train"]
-    val_data = dataset_dict["val"]
-
-    # FIX 1: Fit obs normalizer on training data
-    obs_normalizer.fit(train_data)
-    obs_normalizer.save(OBS_NORM_PATH)
-
-    # FIX 3: DataLoader with batch_size=64
-    train_dataset = PreferenceDataset(train_data, obs_normalizer)
-    val_dataset = PreferenceDataset(val_data, obs_normalizer)
-    train_loader = DataLoader(train_dataset, batch_size=RM_BATCH_SIZE,
-                              shuffle=True, collate_fn=collate_preference_batch)
-    val_loader = DataLoader(val_dataset, batch_size=RM_BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_preference_batch)
-
-    optimizer = optim.Adam(rm.parameters(), lr=lr, weight_decay=RM_WEIGHT_DECAY)
+    optimizer = optim.Adam(rm.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    rm.train()
 
     print(f"\n{'=' * 60}")
-    print(f"  Stage 1: Reward Model Training  ({len(train_data)} pairs)")
-    print(f"  Batch size: {RM_BATCH_SIZE}  |  LR: {lr}")
-    print(f"{'=' * 60}")
+    print(f"  Stage 1 — Bradley-Terry Reward Model")
+    print(f"  Hard pairs  : {len(train_hard)} train  |  {len(val_hard)} val")
+    print(f"  Epochs: {epochs}  |  LR: {lr}  |  Batch: {batch_size}")
+    print(f"  Loss  : -log σ( R(τ_chosen) - R(τ_rejected) )")
+    print(f"  Pool  : mean over timesteps (not sum)")
+    print(f"{'=' * 60}\n")
 
-    best_val_loss = float("inf")
     best_val_acc = 0.0
+    os.makedirs(os.path.dirname(RM_SAVE_PATH), exist_ok=True)
 
     for epoch in range(epochs):
-        total_loss, total_acc, n_batches = 0.0, 0.0, 0
+        rm.train()
+        np.random.shuffle(train_hard)
+        epoch_loss = epoch_acc = 0.0
+        n_batches = 0
 
-        for obs_w_list, act_w_list, obs_l_list, act_l_list in train_loader:
-            batch_loss, batch_acc = 0.0, 0.0
+        for start in range(0, len(train_hard), batch_size):
+            batch = train_hard[start: start + batch_size]
+            batch_loss = torch.tensor(0.0, device=DEVICE)
+            batch_acc  = 0.0
 
-            for obs_w, act_w, obs_l, act_l in zip(
-                    obs_w_list, act_w_list, obs_l_list, act_l_list):
-                obs_w = obs_w.to(DEVICE)
-                act_w = act_w.to(DEVICE)
-                obs_l = obs_l.to(DEVICE)
-                act_l = act_l.to(DEVICE)
+            for pair in batch:
+                obs_w, act_w = _to_tensors(pair["chosen"],   obs_norm)
+                obs_l, act_l = _to_tensors(pair["rejected"], obs_norm)
 
-                # FIX 2: .mean() instead of .sum() — prevents sigmoid saturation
-                reward_w = rm(obs_w, act_w).mean()
-                reward_l = rm(obs_l, act_l).mean()
-                loss = -F.logsigmoid(reward_w - reward_l)
+                r_w = rm(obs_w, act_w)   # scalar
+                r_l = rm(obs_l, act_l)   # scalar
 
-                batch_loss += loss
-                batch_acc += float((reward_w > reward_l).item())
+                # Bradley-Terry: preferred trajectory should have higher reward
+                batch_loss = batch_loss + (-F.logsigmoid(r_w - r_l))
+                batch_acc  += float((r_w > r_l).item())
 
-            # Average over batch, then step
-            batch_loss = batch_loss / len(obs_w_list)
+            batch_loss = batch_loss / len(batch)
             optimizer.zero_grad()
             batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
             optimizer.step()
 
-            total_loss += batch_loss.item()
-            total_acc += batch_acc / len(obs_w_list)
-            n_batches += 1
+            epoch_loss += batch_loss.item()
+            epoch_acc  += batch_acc / len(batch)
+            n_batches  += 1
 
         scheduler.step()
 
-        # Validation
+        # Validation accuracy — no env rollouts needed, just RM forward passes
         rm.eval()
-        val_loss, val_acc, n_val = 0.0, 0.0, 0
+        val_acc = 0.0
         with torch.no_grad():
-            for obs_w_list, act_w_list, obs_l_list, act_l_list in val_loader:
-                for obs_w, act_w, obs_l, act_l in zip(
-                        obs_w_list, act_w_list, obs_l_list, act_l_list):
-                    obs_w = obs_w.to(DEVICE)
-                    act_w = act_w.to(DEVICE)
-                    obs_l = obs_l.to(DEVICE)
-                    act_l = act_l.to(DEVICE)
-                    rw = rm(obs_w, act_w).mean()
-                    rl = rm(obs_l, act_l).mean()
-                    val_loss += -F.logsigmoid(rw - rl).item()
-                    val_acc += float((rw > rl).item())
-                    n_val += 1
-        rm.train()
+            for pair in val_hard:
+                obs_w, act_w = _to_tensors(pair["chosen"],   obs_norm)
+                obs_l, act_l = _to_tensors(pair["rejected"], obs_norm)
+                val_acc += float((rm(obs_w, act_w) > rm(obs_l, act_l)).item())
+        val_acc /= len(val_hard)
 
-        val_acc_pct = val_acc / n_val
-        print(f"  RM Epoch {epoch + 1:>3}/{epochs}  "
-              f"| train loss: {total_loss / n_batches:.4f}  "
-              f"acc: {total_acc / n_batches:.2%}  "
-              f"| val loss: {val_loss / n_val:.4f}  "
-              f"acc: {val_acc_pct:.2%}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_val_acc = val_acc_pct
-            os.makedirs(os.path.dirname(RM_SAVE_PATH), exist_ok=True)
+        improved = val_acc > best_val_acc
+        if improved:
+            best_val_acc = val_acc
             torch.save(rm.state_dict(), RM_SAVE_PATH)
 
-        if val_acc_pct >= RM_MIN_VAL_ACC:
-            print(f"  RM hit target val accuracy {val_acc_pct:.2%} — stopping early.")
-            break
+        print(f"  Epoch {epoch + 1:>3}/{epochs}  "
+              f"| train loss: {epoch_loss / n_batches:.4f}  "
+              f"acc: {epoch_acc / n_batches:.2%}  "
+              f"| val acc: {val_acc:.2%}"
+              + ("  ✓" if improved else ""))
 
-    print(f"  Best RM val acc: {best_val_acc:.2%} → saved to {RM_SAVE_PATH}\n")
+    print(f"\n  Best RM val acc: {best_val_acc:.2%} → {RM_SAVE_PATH}")
 
-    if best_val_acc < 0.62:
-        print(f"  [WARN] RM val accuracy {best_val_acc:.2%} is close to random.")
-        print(f"  [WARN] Check label_data.py output — σ may still be too large.")
-
+    # Reload best checkpoint and freeze
     rm.load_state_dict(torch.load(RM_SAVE_PATH, map_location=DEVICE))
     rm.eval()
+    for p in rm.parameters():
+        p.requires_grad = False
+    print(f"  Reward model frozen — no further gradient updates.\n")
+    return rm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 2: PPO
+# Stage 2: Reward-Weighted Regression (RWR)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_gae(rewards, values, dones, gamma=PPO_GAMMA, lam=PPO_GAE_LAMBDA):
-    T = len(rewards)
-    advantages = torch.zeros(T, device=DEVICE)
-    last_gae = 0.0
-    for t in reversed(range(T)):
-        non_terminal = 1.0 - dones[t].float()
-        next_val = values[t + 1] if t + 1 < T else 0.0
-        delta = rewards[t] + gamma * next_val * non_terminal - values[t]
-        last_gae = delta + gamma * lam * non_terminal * last_gae
-        advantages[t] = last_gae
-    returns = advantages + values
-    return advantages, returns
+def _score_all_trajectories(rm, train_data, obs_norm):
+    """
+    Score every trajectory that appears in the hard-label training pairs
+    using the frozen reward model, and compute normalized RWR weights.
 
+    Both chosen and rejected sides of each pair are scored. This is correct:
+    the RWR update should see the full distribution of behaviors that the
+    BC policy produced, not just the winners, so that low-reward trajectories
+    are down-weighted rather than silently ignored.
 
-def collect_ppo_rollout(env, tasks, policy, value_net, rm, ref_policy,
-                        obs_normalizer, reward_normaliser,
-                        kl_coef=PPO_KL_COEF, n_steps=PPO_STEPS):
-    obs_list, act_list, logp_list = [], [], []
-    rew_list, val_list, done_list = [], [], []
+    Reward normalization (subtract mean, divide std) is applied before
+    computing exp weights. This decouples the weight scale from the reward
+    model's absolute output range so that the temperature β has a consistent
+    interpretation regardless of the RM's scale.
+    Reference: Dong et al. (2023), arXiv 2308.12050, Section 3.
 
-    task = tasks[np.random.randint(len(tasks))]
-    env.set_task(task)
-    obs, _ = env.reset()
+    Returns
+    -------
+    list of dicts, each containing:
+        obs_n   : (T, obs_dim) float32 ndarray, already normalized
+        acts    : (T, act_dim) float32 ndarray
+        reward  : float, raw RM score
+        reward_norm : float, normalized RM score
+        success : bool
+    """
+    hard_pairs = [p for p in train_data if p["label"] == 1.0]
+    trajs = []
 
-    policy.eval()
-    value_net.eval()
-
+    rm.eval()
     with torch.no_grad():
-        steps = 0
-        ep_steps = 0
-        while steps < n_steps:
-            # FIX 1: Normalize obs before feeding to policy/value
-            obs_norm = obs_normalizer.normalize(obs.astype(np.float32))
-            obs_t = torch.FloatTensor(obs_norm).unsqueeze(0).to(DEVICE)
-            action, logp, _ = policy.get_action_and_logprob(obs_t)
-            val = value_net(obs_t)
+        for pair in hard_pairs:
+            for side in ("chosen", "rejected"):
+                t = pair[side]
+                obs_n = obs_norm.normalize(t["observations"].astype(np.float32))
+                obs_t = torch.FloatTensor(obs_n).to(DEVICE)
+                act_t = torch.FloatTensor(t["actions"].astype(np.float32)).to(DEVICE)
+                r = rm(obs_t, act_t).item()   # scalar
+                trajs.append({
+                    "obs_n":   obs_n,
+                    "acts":    t["actions"].astype(np.float32),
+                    "reward":  r,
+                    "success": t["success"],
+                })
 
-            action_np = action.squeeze(0).cpu().numpy()
-            action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
+    raw = np.array([t["reward"] for t in trajs])
+    r_mean, r_std = raw.mean(), max(raw.std(), 1e-8)
+    for t in trajs:
+        t["reward_norm"] = (t["reward"] - r_mean) / r_std
 
-            next_obs, _, terminated, truncated, _ = env.step(action_np)
-            done = terminated or truncated
-
-            # Shaped reward — also normalize obs for RM
-            rm_reward = rm(obs_t, action).item()
-            ref_logp = ref_policy.get_logprob(obs_t, action).item()
-            kl_penalty = logp.item() - ref_logp
-            shaped_rew = rm_reward - kl_coef * kl_penalty
-
-            obs_list.append(obs_norm)
-            act_list.append(action_np.astype(np.float32))
-            logp_list.append(logp.item())
-            rew_list.append(shaped_rew)
-            val_list.append(val.item())
-            done_list.append(float(done))
-
-            obs = next_obs
-            steps += 1
-            ep_steps += 1
-
-            if done or ep_steps >= MAX_EPISODE_STEPS:
-                task = tasks[np.random.randint(len(tasks))]
-                env.set_task(task)
-                obs, _ = env.reset()
-                ep_steps = 0
-
-    policy.train()
-    value_net.train()
-
-    raw_rewards = np.array(rew_list)
-    if PPO_REWARD_NORM:
-        reward_normaliser.update(raw_rewards)
-        normalised_rewards = reward_normaliser.normalise(raw_rewards)
-    else:
-        normalised_rewards = raw_rewards
-
-    obs_t = torch.FloatTensor(np.array(obs_list)).to(DEVICE)
-    act_t = torch.FloatTensor(np.array(act_list)).to(DEVICE)
-    logp_t = torch.FloatTensor(logp_list).to(DEVICE)
-    rew_t = torch.FloatTensor(normalised_rewards).to(DEVICE)
-    val_t = torch.FloatTensor(val_list).to(DEVICE)
-    done_t = torch.FloatTensor(done_list).to(DEVICE)
-
-    adv_t, ret_t = compute_gae(rew_t, val_t, done_t)
-    adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-
-    return dict(obs=obs_t, act=act_t, logp=logp_t, adv=adv_t, ret=ret_t, val=val_t)
+    print(f"[RWR] Scored {len(trajs)} trajectories "
+          f"({sum(t['success'] for t in trajs)} successful)")
+    print(f"[RWR] Raw reward   — mean: {r_mean:.4f}  std: {r_std:.4f}  "
+          f"range: [{raw.min():.4f}, {raw.max():.4f}]")
+    norm = np.array([t["reward_norm"] for t in trajs])
+    print(f"[RWR] Norm reward  — mean: {norm.mean():.4f}  std: {norm.std():.4f}  "
+          f"range: [{norm.min():.4f}, {norm.max():.4f}]")
+    return trajs
 
 
-def ppo_update(policy, value_net, policy_optimizer, value_optimizer, rollout,
-               clip_eps=PPO_CLIP_EPS, value_coef=PPO_VALUE_COEF,
-               entropy_coef=PPO_ENTROPY_COEF, opt_epochs=PPO_OPT_EPOCHS,
-               mini_batch=PPO_MINI_BATCH):
-    N = rollout["obs"].shape[0]
-    old_vals = rollout["val"].detach()
-    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "n": 0}
+def train_rwr(policy, rm, train_data, val_data, obs_norm,
+              epochs=RWR_EPOCHS, lr=RWR_LR, beta=RWR_BETA):
+    """
+    Fine-tune the BC policy with Reward-Weighted Regression (RWR).
 
-    for _ in range(opt_epochs):
-        idxs = torch.randperm(N)
-        for start in range(0, N, mini_batch):
-            b = idxs[start: start + mini_batch]
-            obs_b = rollout["obs"][b]
-            act_b = rollout["act"][b]
-            adv_b = rollout["adv"][b]
-            ret_b = rollout["ret"][b]
-            old_lp = rollout["logp"][b]
-            old_v = old_vals[b]
+    Algorithm (Peters & Schaal, 2007)
+    ----------------------------------
+    Given fixed weights  w_i = exp( R_norm(τ_i) / β ):
 
-            _, new_lp, entropy = policy.get_action_and_logprob(obs_b, act_b)
-            new_val = value_net(obs_b)
+        θ* = argmax_θ  Σ_i  w_i · log π_θ(τ_i)
 
-            ratio = torch.exp(new_lp - old_lp)
-            clip_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
-            policy_loss = -torch.min(ratio * adv_b, clip_ratio * adv_b).mean()
+    This is exactly the weighted MLE problem, which is standard
+    supervised learning with per-sample importance weights.  The RM
+    is frozen — there are no on-policy rollouts, no value functions,
+    and no RL update rules. The entire fine-tuning stage is a
+    weighted regression over the existing trajectory dataset.
 
-            if PPO_VALUE_CLIP:
-                v_clipped = old_v + torch.clamp(new_val - old_v, -clip_eps, clip_eps)
-                v_loss_raw = F.mse_loss(new_val, ret_b)
-                v_loss_clip = F.mse_loss(v_clipped, ret_b)
-                value_loss = torch.max(v_loss_raw, v_loss_clip)
-            else:
-                value_loss = F.mse_loss(new_val, ret_b)
+    Connection to KL-regularized RL (why this is principled fine-tuning)
+    ----------------------------------------------------------------------
+    The above objective is the exact solution to:
 
-            entropy_loss = -entropy.mean()
+        max_π  E_π[R(τ)]  −  β · KL( π ‖ π_BC )
 
-            policy_total = policy_loss + entropy_coef * entropy_loss
-            policy_optimizer.zero_grad()
-            policy_total.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), PPO_MAX_GRAD_NORM)
-            policy_optimizer.step()
+    (Peters & Schaal 2007; Peng et al. 2019).  Setting π_ref = π_BC means:
+      (a) We never stray far from the behavior the BC policy already learned.
+      (b) The only parts of the policy that change are those where the RM
+          provides a clear signal (high vs. low reward trajectories differ).
+      (c) The warm-start from BC weights means the weighted MLE converges
+          quickly — we are already in a good region of parameter space.
 
-            value_optimizer.zero_grad()
-            (value_coef * value_loss).backward()
-            torch.nn.utils.clip_grad_norm_(value_net.parameters(), PPO_MAX_GRAD_NORM)
-            value_optimizer.step()
+    This is fundamentally different from training RLHF from scratch, where
+    π_ref would be a random policy and the KL penalty would have nothing
+    useful to anchor to.
+    """
+    trajs = _score_all_trajectories(rm, train_data, obs_norm)
 
-            stats["policy_loss"] += policy_loss.item()
-            stats["value_loss"] += value_loss.item()
-            stats["entropy"] += (-entropy_loss).item()
-            stats["n"] += 1
+    # Compute and normalize RWR weights
+    weights = np.array([np.exp(t["reward_norm"] / beta) for t in trajs],
+                       dtype=np.float64)
+    weights /= weights.sum()   # probability distribution over trajectories
 
-    n = stats["n"]
-    return {k: v / n for k, v in stats.items() if k != "n"}
+    eff_n = 1.0 / (weights ** 2).sum()
+    print(f"[RWR] β = {beta}")
+    print(f"[RWR] Weight stats — max: {weights.max():.5f}  "
+          f"min: {weights.min():.7f}  "
+          f"effective N: {eff_n:.1f} / {len(trajs)}")
 
-
-def evaluate_policy(env, tasks, policy, obs_normalizer, n_episodes=20):
-    policy.eval()
-    returns, successes = [], []
-    with torch.no_grad():
-        for _ in range(n_episodes):
-            task = tasks[np.random.randint(len(tasks))]
-            env.set_task(task)
-            obs, _ = env.reset()
-            ep_ret, success = 0.0, False
-            for _ in range(MAX_EPISODE_STEPS):
-                obs_norm = obs_normalizer.normalize(obs.astype(np.float32))
-                obs_t = torch.FloatTensor(obs_norm).unsqueeze(0).to(DEVICE)
-                action, _, _ = policy.get_action_and_logprob(obs_t)
-                action_np = np.clip(action.squeeze(0).cpu().numpy(),
-                                    env.action_space.low, env.action_space.high)
-                obs, reward, terminated, truncated, info = env.step(action_np)
-                ep_ret += reward
-                if info.get("success", False):
-                    success = True
-                if terminated or truncated:
-                    break
-            returns.append(ep_ret)
-            successes.append(float(success))
-    policy.train()
-    return {"mean_return": float(np.mean(returns)),
-            "success_rate": float(np.mean(successes))}
-
-
-def save_resume_checkpoint(path, policy, value_net, policy_optimizer,
-                           value_optimizer, reward_normaliser, iteration, best_success):
-    torch.save({
-        "iteration": iteration,
-        "best_success": best_success,
-        "policy": policy.state_dict(),
-        "value_net": value_net.state_dict(),
-        "policy_optimizer": policy_optimizer.state_dict(),
-        "value_optimizer": value_optimizer.state_dict(),
-        "rms_mean": reward_normaliser.mean,
-        "rms_var": reward_normaliser.var,
-        "rms_count": reward_normaliser.count,
-    }, path)
-
-
-def load_resume_checkpoint(path, policy, value_net, policy_optimizer,
-                           value_optimizer, reward_normaliser):
-    ckpt = torch.load(path, map_location=DEVICE)
-    policy.load_state_dict(ckpt["policy"])
-    value_net.load_state_dict(ckpt["value_net"])
-    policy_optimizer.load_state_dict(ckpt["policy_optimizer"])
-    value_optimizer.load_state_dict(ckpt["value_optimizer"])
-    reward_normaliser.mean = ckpt["rms_mean"]
-    reward_normaliser.var = ckpt["rms_var"]
-    reward_normaliser.count = ckpt["rms_count"]
-    print(f"[INFO] Resumed from iteration {ckpt['iteration'] + 1}")
-    return ckpt["iteration"] + 1, ckpt["best_success"]  # start_iter, best_success
-
-
-def train_ppo(policy, value_net, rm, ref_policy, obs_normalizer,
-              ppo_epochs=PPO_EPOCHS, kl_coef=PPO_KL_COEF, resume=False):
-    ml1 = metaworld.ML1(ENV_NAME)
-    env = ml1.train_classes[ENV_NAME]()
-    tasks = ml1.train_tasks
-
-    policy_optimizer = optim.Adam(policy.parameters(), lr=PPO_LR)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=PPO_VALUE_LR)
-    reward_normaliser = RunningMeanStd()
-
-    start_iter = 0
-    best_success = -1.0
-
-    # ── Resume from checkpoint if requested ──────────────────────────────────
-    if resume and os.path.exists(RESUME_CKPT_PATH):
-        start_iter, best_success = load_resume_checkpoint(
-            RESUME_CKPT_PATH, policy, value_net,
-            policy_optimizer, value_optimizer, reward_normaliser)
-    elif resume:
-        print("[WARN] --resume set but no checkpoint found — starting fresh.")
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     print(f"\n{'=' * 60}")
-    print(f"  Stage 2: PPO Training  ({ppo_epochs} iterations)")
-    print(f"  Starting from iteration: {start_iter}")
-    print(f"  Policy lr: {PPO_LR}  |  Value lr: {PPO_VALUE_LR}")
-    print(f"  Reward norm: {PPO_REWARD_NORM}  |  Value clip: {PPO_VALUE_CLIP}")
-    print(f"{'=' * 60}")
+    print(f"  Stage 2 — Reward-Weighted Regression (RWR)")
+    print(f"  Trajectories : {len(trajs)}")
+    print(f"  β (temperature) : {beta}")
+    print(f"  Epochs: {epochs}  |  LR: {lr}  |  Batch: {RWR_BATCH}")
+    print(f"  Init   : BC policy checkpoint")
+    print(f"  Ckpt   : best deterministic success rate")
+    print(f"{'=' * 60}\n")
 
-    os.makedirs(os.path.dirname(RLHF_POLICY_SAVE_PATH), exist_ok=True)
+    best_success = -1.0
+    best_return  = -float("inf")
+    os.makedirs(os.path.dirname(RWR_SAVE_PATH), exist_ok=True)
+    indices = np.arange(len(trajs))
 
-    for iteration in range(start_iter, ppo_epochs):
-        rollout = collect_ppo_rollout(
-            env, tasks, policy, value_net, rm, ref_policy,
-            obs_normalizer, reward_normaliser, kl_coef=kl_coef
-        )
-        stats = ppo_update(policy, value_net, policy_optimizer,
-                           value_optimizer, rollout)
+    for epoch in range(epochs):
+        policy.train()
+        np.random.shuffle(indices)
+        epoch_loss = 0.0
+        n_batches = 0
 
-        if (iteration + 1) % 10 == 0:
-            eval_stats = evaluate_policy(env, tasks, policy, obs_normalizer,
-                                         n_episodes=20)
-            print(f"  Iter {iteration + 1:>4}/{ppo_epochs}  "
-                  f"| π_loss: {stats['policy_loss']:.4f}  "
-                  f"| v_loss: {stats['value_loss']:.4f}  "
-                  f"| entropy: {stats['entropy']:.4f}  "
-                  f"| ret: {eval_stats['mean_return']:.2f}  "
-                  f"| success: {eval_stats['success_rate']:.2%}")
+        for start in range(0, len(trajs), RWR_BATCH):
+            batch_idx = indices[start: start + RWR_BATCH]
+            batch_loss  = torch.tensor(0.0, device=DEVICE)
+            batch_w_sum = 0.0
 
-            # Save best policy checkpoint
-            if eval_stats["mean_return"] > best_success:
-                best_success = eval_stats["mean_return"]
-                torch.save(policy.state_dict(), RLHF_POLICY_SAVE_PATH)
+            for i in batch_idx:
+                t   = trajs[i]
+                w_i = float(weights[i])
 
-            # Save full resume checkpoint every 10 iters
-            save_resume_checkpoint(
-                RESUME_CKPT_PATH, policy, value_net,
-                policy_optimizer, value_optimizer,
-                reward_normaliser, iteration, best_success)
+                obs_t = torch.FloatTensor(t["obs_n"]).to(DEVICE)
+                act_t = torch.FloatTensor(t["acts"]).to(DEVICE)
 
-            # Also copy resume checkpoint to Drive for safety
-            drive_resume = "/content/drive/MyDrive/CS234_Project/checkpoints/ppo_resume.pt"
-            if os.path.exists("/content/drive"):
-                import shutil
-                shutil.copy(RESUME_CKPT_PATH, drive_resume)
+                # log π_θ(τ) = (1/T) Σ_t log π_θ(a_t | s_t)
+                # Mean over steps so trajectory length doesn't bias the loss.
+                mu, std = policy.forward(obs_t)
+                log_pi_tau = Normal(mu, std).log_prob(act_t).sum(dim=-1).mean()
 
-    print(f"  Best RLHF policy saved → {RLHF_POLICY_SAVE_PATH}\n")
+                batch_loss  = batch_loss + (-w_i * log_pi_tau)
+                batch_w_sum += w_i
+
+            # Normalize by the total weight mass in this batch so that a
+            # batch dominated by one high-weight trajectory doesn't produce
+            # an outsized gradient step.
+            if batch_w_sum > 0:
+                batch_loss = batch_loss / batch_w_sum
+
+            optimizer.zero_grad()
+            batch_loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+
+            epoch_loss += batch_loss.item()
+            n_batches  += 1
+
+        scheduler.step()
+
+        if (epoch + 1) % EVAL_EVERY == 0 or epoch == 0:
+            ret_d, succ_d = env_eval(policy, obs_norm, EVAL_EPS, deterministic=True)
+            # Primary criterion: success rate. Tiebreaker: mean return.
+            # Among equally successful policies, higher return means the task
+            # is completed faster / more efficiently (Yu et al. 2021, MetaWorld).
+            improved = (succ_d > best_success) or \
+                       (succ_d == best_success and ret_d > best_return)
+            if improved:
+                best_success = succ_d
+                best_return  = ret_d
+                torch.save(policy.state_dict(), RWR_SAVE_PATH)
+            print(f"  Epoch {epoch + 1:>3}/{epochs}  "
+                  f"| loss: {epoch_loss / n_batches:.4f}  "
+                  f"| success: {succ_d:.2%}  return: {ret_d:.1f}"
+                  + ("  ✓" if improved else ""))
+        else:
+            print(f"  Epoch {epoch + 1:>3}/{epochs}  "
+                  f"| loss: {epoch_loss / n_batches:.4f}")
+
+    print(f"\n  Best RWR checkpoint: {best_success:.2%} success → {RWR_SAVE_PATH}")
+    policy.load_state_dict(torch.load(RWR_SAVE_PATH, map_location=DEVICE))
+    return policy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -642,34 +443,58 @@ def train_ppo(policy, value_net, rm, ref_policy, obs_normalizer,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default=PREF_DATASET_PATH)
-    parser.add_argument("--rm_epochs", type=int, default=RM_EPOCHS)
-    parser.add_argument("--ppo_epochs", type=int, default=PPO_EPOCHS)
-    parser.add_argument("--kl_coef", type=float, default=PPO_KL_COEF)
-    parser.add_argument("--skip_rm", action="store_true")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume PPO from last saved checkpoint")
+    parser.add_argument("--data",       required=True,
+                        help="Preference dataset pkl from label_data.py")
+    parser.add_argument("--bc",         default=BC_CKPT,
+                        help="BC policy checkpoint from train_bc.py")
+    parser.add_argument("--obs_norm",   default=OBS_NORM_PATH,
+                        help="Obs normalizer npz from train_bc.py")
+    parser.add_argument("--rm_epochs",  type=int,   default=RM_EPOCHS)
+    parser.add_argument("--rwr_epochs", type=int,   default=RWR_EPOCHS)
+    parser.add_argument("--rm_lr",      type=float, default=RM_LR)
+    parser.add_argument("--rwr_lr",     type=float, default=RWR_LR)
+    parser.add_argument("--beta",       type=float, default=RWR_BETA,
+                        help="RWR temperature β. Lower = more aggressive "
+                             "re-weighting away from BC.")
+    parser.add_argument("--skip_rm",    action="store_true",
+                        help="Load existing RM checkpoint instead of retraining")
     args = parser.parse_args()
 
-    reward_model = ContinuousRewardModel().to(DEVICE)
-    policy = ContinuousGaussianPolicy().to(DEVICE)
-    value_net = ValueNetwork().to(DEVICE)
-    obs_normalizer = ObsNormalizer()
+    # ── Load preference dataset ───────────────────────────────────────────────
+    with open(args.data, "rb") as f:
+        ds = pickle.load(f)
+    train_data, val_data = ds["train"], ds["val"]
+    print(f"[INFO] Loaded {len(train_data)} train / {len(val_data)} val pairs "
+          f"from {args.data}")
 
-    ref_policy = copy.deepcopy(policy)
-    ref_policy.eval()
-    for p in ref_policy.parameters():
-        p.requires_grad = False
+    # ── Load obs normalizer (fitted on BC data, reused here) ──────────────────
+    obs_norm = ObsNormalizer()
+    obs_norm.load(args.obs_norm)
+
+    # ── Stage 1: Bradley-Terry Reward Model ───────────────────────────────────
+    rm = RewardModel().to(DEVICE)
 
     if args.skip_rm and os.path.exists(RM_SAVE_PATH):
         print(f"[INFO] Loading existing RM from {RM_SAVE_PATH}")
-        reward_model.load_state_dict(torch.load(RM_SAVE_PATH, map_location=DEVICE))
-        reward_model.eval()
-        obs_normalizer.load(OBS_NORM_PATH)
-        print(f"[INFO] Loaded obs normalizer from {OBS_NORM_PATH}")
+        rm.load_state_dict(torch.load(RM_SAVE_PATH, map_location=DEVICE))
+        rm.eval()
+        for p in rm.parameters():
+            p.requires_grad = False
+        print(f"[INFO] Reward model frozen.")
     else:
-        train_reward_model(reward_model, obs_normalizer,
-                           data_path=args.data, epochs=args.rm_epochs)
+        rm = train_reward_model(rm, train_data, val_data, obs_norm,
+                                epochs=args.rm_epochs, lr=args.rm_lr)
 
-    train_ppo(policy, value_net, reward_model, ref_policy, obs_normalizer,
-              ppo_epochs=args.ppo_epochs, kl_coef=args.kl_coef, resume=args.resume)
+    # ── Stage 2: RWR fine-tuning of BC policy ─────────────────────────────────
+    policy = GaussianPolicy().to(DEVICE)
+    policy.load_state_dict(torch.load(args.bc, map_location=DEVICE))
+    print(f"[INFO] Loaded BC policy from {args.bc}")
+
+    policy = train_rwr(policy, rm, train_data, val_data, obs_norm,
+                       epochs=args.rwr_epochs, lr=args.rwr_lr, beta=args.beta)
+
+    # ── Final evaluation ──────────────────────────────────────────────────────
+    print(f"\n--- RLHF (RWR) final evaluation ---")
+    ret_d, succ_d = env_eval(policy, obs_norm, n_episodes=50, deterministic=True)
+    print(f"  Deterministic : return {ret_d:.2f}  success {succ_d:.2%}")
+    print(f"\n[INFO] Saved RLHF policy → {RWR_SAVE_PATH}")

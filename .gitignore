@@ -223,6 +223,10 @@ checkpoints/
 *.pt
 *.mp4
 
+#figures/data
+data/
+figures/
+
 # Misc
 .DS_Store
 .idea/
