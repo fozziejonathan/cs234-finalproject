@@ -152,7 +152,42 @@ def train_dpo(policy, ref_policy, train_data, val_data, obs_norm,
     ret_d, succ_d = env_eval(policy, obs_norm, DPO_EVAL_EPS, deterministic=True)
     best_success = succ_d
     torch.save(policy.state_dict(), DPO_SAVE_PATH)
-    print(f"  Epoch 0 baseline: success {succ_d:.2%}")
+
+    diag0 = run_diagnostics(policy, ref_policy, bc_policy_init,
+                            train_hard[:50], obs_norm, beta)
+    print(f"  [DIAG] kl={diag0['kl_div']:.4f}  "
+          f"log_π(w)={diag0['log_pi_w']:.3f}  "
+          f"log_π(l)={diag0['log_pi_l']:.3f}  "
+          f"rw={diag0['rw']:.4f}  rl={diag0['rl']:.4f}  "
+          f"margin={diag0['margin']:.4f}  "
+          f"μ_drift={diag0['mu_drift']:.6f}  "
+          f"grad_norm=0.0000")
+
+    policy.eval()
+    val_acc0 = 0.0
+    with torch.no_grad():
+        for pair in val_hard:
+            obs_w = torch.FloatTensor(
+                obs_norm.normalize(pair["chosen"]["observations"].astype(np.float32))
+            ).to(DEVICE)
+            act_w = torch.FloatTensor(
+                pair["chosen"]["actions"].astype(np.float32)
+            ).to(DEVICE)
+            obs_l = torch.FloatTensor(
+                obs_norm.normalize(pair["rejected"]["observations"].astype(np.float32))
+            ).to(DEVICE)
+            act_l = torch.FloatTensor(
+                pair["rejected"]["actions"].astype(np.float32)
+            ).to(DEVICE)
+            _, m = dpo_loss(policy, ref_policy, obs_w, act_w, obs_l, act_l, beta)
+            val_acc0 += m["accuracy"]
+    val_acc0 /= len(val_hard)
+
+    print(f"  Epoch   0/{epochs}  "
+          f"| loss: n/a        "
+          f"pref_acc:   n/a  "
+          f"val_acc: {val_acc0:.2%}  "
+          f"| success: {succ_d:.2%}  return: {ret_d:.1f}")
 
     for epoch in range(epochs):
         policy.train()

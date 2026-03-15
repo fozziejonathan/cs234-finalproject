@@ -8,20 +8,20 @@ os.makedirs('figures', exist_ok=True)
 
 # Epoch 0 is the baseline (before any gradient steps)
 # DPO — copy from your terminal
-dpo_success  = [92.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+dpo_success  = [82.67, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
 
-dpo_pref_acc = [None, 83.61, 85.83, 87.12, 89.36, 91.14, 93.10, 94.77, 96.15, 96.67, 97.28, 97.64, 97.78, 97.83, 97.89, 97.96, 97.96, 97.98, 97.95, 98.03]
+dpo_pref_acc = [None, 89.40, 95.48, 97.05, 97.54, 97.80, 97.93, 98.07, 98.15, 98.23, 98.30, 98.35, 98.46, 98.48, 98.51, 98.52, 98.55, 98.56, 98.57, 98.56, 98.57]
 
-dpo_log_pi_w = [-8.051, -28.503, -50.412, -68.897, -78.408, -91.105, -103.869, -110.059, -119.917, -112.436, -132.025, -125.223, -128.193, -143.884, -150.426, -140.595, -132.190, -136.981, -141.445, -142.552]
+dpo_log_pi_w = [-1.307, -62.285, -131.545, -200.434, -278.403, -305.961, -340.062, -397.441, -442.295, -470.929, -495.769, -569.219, -571.339, -610.729, -620.222, -662.625, -641.249, -663.321, -711.955, -718.243, -657.835]
 
 # DPOP — copy from your terminal
-dpop_success = [88.0, 96.0, 92.0, 90.0, 94.0, 92.0, 90.0, 96.0, 94.0, 88.0, 92.0, 88.0, 92.0, 94.0, 96.0, 94.0, 90.0, 100.0, 92.0, 86.0]
+dpop_success = [82.67, 81.33, 82.67, 80.67, 79.33, 84.67, 81.33, 86.00, 86.00, 77.33, 78.67, 80.00, 82.00, 80.00, 79.33, 78.00, 78.67, 79.33, 78.00, 79.33, 78.67]
 
-dpop_pref_acc = [None, 79.12, 88.03, 87.61, 89.70, 90.25, 90.18, 90.74, 90.93, 91.22, 91.80, 91.98, 92.27, 92.15, 92.35, 92.23, 92.21, 92.29, 92.15, 92.33]
+dpop_pref_acc = [None, 89.08, 91.50, 91.57, 91.35, 91.06, 90.47, 90.01, 89.76, 89.72, 89.47, 89.45, 89.40, 89.50, 89.45, 89.33, 89.48, 89.54, 89.59, 89.59, 89.56]
 
-dpop_log_pi_w = [-1.275, -1.266, -1.256, -1.259, -1.252, -1.252, -1.230, -1.227, -1.262, -1.240, -1.267, -1.258, -1.271, -1.260, -1.251, -1.255, -1.248, -1.235, -1.231, -1.245]
+dpop_log_pi_w = [-1.307, -1.207, -1.174, -1.215, -1.191, -1.185, -1.224, -1.213, -1.214, -1.197, -1.257, -1.213, -1.214, -1.232, -1.211, -1.216, -1.213, -1.200, -1.189, -1.272, -1.233]
 
-BC_SUCCESS = 92.75  # your held-out eval number
+BC_SUCCESS = 82.67  # your held-out eval number
 
 epochs = list(range(len(dpo_success)))  # [0, 1, 2, ..., 20]
 
@@ -29,8 +29,6 @@ epochs = list(range(len(dpo_success)))  # [0, 1, 2, ..., 20]
 fig, ax1 = plt.subplots(figsize=(8, 5))
 
 # Success rate — left axis
-ax1.axhline(BC_SUCCESS, color='gray', linestyle='--', linewidth=1.5,
-            label=f'BC baseline ({BC_SUCCESS:.1f}%)')
 ax1.plot(epochs, dpo_success,  color='tomato',      linewidth=2, marker='o',
          markersize=4, label='DPO success rate')
 ax1.plot(epochs, dpop_success, color='steelblue',   linewidth=2, marker='s',
@@ -57,7 +55,8 @@ lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right', fontsize=10)
 
-ax1.set_title('Training Dynamics: DPO vs DPOP', fontsize=13)
+ax1.set_title('Training Dynamics in Peg-Insert-Side: DPO vs DPOP', fontsize=13)
+ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
 ax1.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('figures/training_dynamics.png', dpi=150, bbox_inches='tight')
@@ -70,12 +69,12 @@ ax.plot(epochs, dpo_log_pi_w,  color='tomato',    linewidth=2, marker='o',
         markersize=4, label='DPO  log π(w)')
 ax.plot(epochs, dpop_log_pi_w, color='steelblue', linewidth=2, marker='s',
         markersize=4, label='DPOP log π(w)')
-ax.axhline(dpo_log_pi_w[0], color='gray', linestyle='--', linewidth=1.5,
-           label=f'BC reference ({dpo_log_pi_w[0]:.2f})')
 
 ax.set_xlabel('Epoch', fontsize=12)
 ax.set_ylabel('log π(w)  [chosen trajectory log-prob]', fontsize=12)
-ax.set_title('Likelihood Displacement: DPO vs DPOP', fontsize=13)
+ax.set_xlim(0, 20)
+ax.set_title('Likelihood Displacement in Peg-Insert-Side: DPO vs DPOP', fontsize=13)
+ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
 ax.legend(fontsize=10)
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
