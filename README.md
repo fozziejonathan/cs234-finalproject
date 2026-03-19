@@ -1,7 +1,7 @@
 # Preference-Based Learning for Continuous Control
 CS 234 Final Project — Jonathan Lu
 
-We compare RLHF and DPO for fine-tuning robot manipulation policies in MetaWorld, starting from a BC baseline trained on expert demos. We also implement DPOP, a DPO variant that adds a regularization penalty to prevent likelihood collapse.
+We compare RLHF and DPO for fine-tuning robot manipulation policies in Meta-World, starting from a BC baseline trained on expert demos. We also implement DPOP, a DPO variant that adds a regularization penalty to prevent likelihood collapse.
 
 ## Setup
 
