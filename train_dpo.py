@@ -150,8 +150,6 @@ def train_dpo(policy, ref_policy, train_data, val_data, obs_norm,
         p.requires_grad = False
 
     ret_d, succ_d = env_eval(policy, obs_norm, DPO_EVAL_EPS, deterministic=True)
-    best_success = succ_d
-    torch.save(policy.state_dict(), DPO_SAVE_PATH)
 
     diag0 = run_diagnostics(policy, ref_policy, bc_policy_init,
                             train_hard[:50], obs_norm, beta)
